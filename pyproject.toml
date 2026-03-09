@@ -17,7 +17,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/fizzi01/pyinputcapturee"
+Repository = "https://github.com/fizzi01/pyinputcapture"
 
 [tool.maturin]
 features = ["extension-module"]
