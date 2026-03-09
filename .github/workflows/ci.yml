@@ -54,7 +54,7 @@ jobs:
             manylinux: auto
           - name: aarch64
             rust-target: aarch64-unknown-linux-gnu
-            manylinux: 2_28
+            manylinux: auto
         python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
