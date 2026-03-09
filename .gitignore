@@ -1,0 +1,23 @@
+# Rust
+target/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.so
+*.whl
+
+# Maturin
+*.d
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Environment
+.env
+.venv/

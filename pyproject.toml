@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pyinputcapture"
+version = "0.1.1"
+description = "Python bindings for the XDG InputCapture portal (Wayland cursor capture via ashpd)"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Desktop Environment",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/fizzi01/pyinputcapturee"
+
+[tool.maturin]
+features = ["extension-module"]
+python-source = "python"
+module-name = "pyinputcapture.pyinputcapture"
+include = ["python/pyinputcapture/py.typed", "python/pyinputcapture/*.pyi"]
