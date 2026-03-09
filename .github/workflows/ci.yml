@@ -31,10 +31,16 @@ jobs:
         run: cargo test
 
       - name: Install (dev)
-        run: pip install maturin pytest && maturin develop
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin pytest
+          maturin develop
 
       - name: Python tests
-        run: python -m pytest tests/ -v
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/ -v
 
   build:
     needs: test
