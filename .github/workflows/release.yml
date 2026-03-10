@@ -19,6 +19,37 @@ jobs:
         with:
           release-type: python
 
+      - name: Sync lib version
+        if: ${{ steps.release.outputs.pr != '' }}
+        run: |
+          # Checkout the PR branch
+          PR_BRANCH=$(echo '${{ steps.release.outputs.pr }}' | jq -r '.headBranchName')
+          git fetch origin "$PR_BRANCH"
+          git checkout "$PR_BRANCH"
+
+          # Extract version from pyproject.toml
+          VERSION=$(grep -m1 '^version' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "Detected version: $VERSION"
+
+          # Update Cargo.toml
+          CARGO_TOML="./Cargo.toml"
+          sed "s/^version = .*/version = \"$VERSION\"/" "$CARGO_TOML" > tmp && mv tmp "$CARGO_TOML"
+
+          # Update python version in __init__.py
+          INIT_PY="./python/pyinputcapture/__init__.py"
+          sed "s/__version__ = .*/__version__ = '$VERSION'/" "$INIT_PY" > tmp && mv tmp "$INIT_PY"
+
+          # Amend the existing commit and force push
+          if git diff --quiet "$CARGO_TOML" "$INIT_PY"; then
+            echo "Already up to date"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "$CARGO_TOML" "$INIT_PY"
+            git commit --amend --no-edit
+            git push --force origin "$PR_BRANCH"
+          fi
+
   build:
     needs: release-please
     if: needs.release-please.outputs.release_created
