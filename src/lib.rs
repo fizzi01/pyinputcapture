@@ -3,12 +3,17 @@
 //! Exposes `InputCapturePortal` to Python: a blocking API backed by a
 //! tokio runtime.  Python communicates with the background task through
 //! channels.
+//!
+//! Activation data (barrier_id, cursor position) is shared via atomics
+//! packed in a single `SharedActivation` struct behind one `Arc`.
+//! `activation_id` is written **last** with `Release` ordering so that
+//! a Python `Acquire` load that sees the new ID is guaranteed to also
+//! see the corresponding barrier_id and cursor position.
 
-use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ashpd::desktop::input_capture::{ActivatedBarrier, Barrier, Capabilities, InputCapture};
 use futures_util::StreamExt;
@@ -32,14 +37,42 @@ struct SetupResult {
     barrier_map: Vec<(u32, String)>,
 }
 
+/// Shared activation data between the tokio task and Python readers.
+/// Laid out so that `activation_id` (the sequencing field) and
+/// `barrier_id` share the same cache line.
+#[repr(C)]
+struct SharedActivation {
+    activation_id: AtomicU32,
+    barrier_id: AtomicU32,
+    cursor_pos_x: AtomicU64,
+    cursor_pos_y: AtomicU64,
+}
+
+impl SharedActivation {
+    fn new() -> Self {
+        Self {
+            activation_id: AtomicU32::new(0),
+            barrier_id: AtomicU32::new(0),
+            cursor_pos_x: AtomicU64::new(0),
+            cursor_pos_y: AtomicU64::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.activation_id.store(0, Ordering::Relaxed);
+        self.barrier_id.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Build edge barriers for every zone, filtering by `active_edges` if given.
 /// End-coordinates use `size - 1` (inclusive) per the InputCapture spec.
 fn build_barriers(
     zones: &[(u32, u32, i32, i32)],
     active_edges: Option<&[String]>,
 ) -> (Vec<Barrier>, Vec<(u32, String)>) {
-    let mut barriers = Vec::new();
-    let mut barrier_map = Vec::new();
+    let max_count = zones.len() * 4;
+    let mut barriers = Vec::with_capacity(max_count);
+    let mut barrier_map = Vec::with_capacity(max_count);
     let mut bid: u32 = 1;
     for &(w, h, x_off, y_off) in zones {
         let w = w as i32;
@@ -67,41 +100,10 @@ fn build_barriers(
     (barriers, barrier_map)
 }
 
-/// Task entry point; catches and logs errors.
-async fn portal_task(
-    setup_tx: oneshot::Sender<Result<SetupResult, String>>,
-    cmd_rx: mpsc::Receiver<Cmd>,
-    activation_id: Arc<AtomicU32>,
-    barrier_id: Arc<AtomicU32>,
-    cursor_pos_x: Arc<AtomicU64>,
-    cursor_pos_y: Arc<AtomicU64>,
-    activated_queue: Arc<Mutex<VecDeque<(u32, f64, f64)>>>,
-    active_edges: Option<Vec<String>>,
-) {
-    if let Err(e) = run_portal(
-        setup_tx,
-        cmd_rx,
-        &activation_id,
-        &barrier_id,
-        &cursor_pos_x,
-        &cursor_pos_y,
-        &activated_queue,
-        active_edges,
-    )
-    .await
-    {
-        eprintln!("pyinputcapture: portal task error: {e}");
-    }
-}
-
 async fn run_portal(
     setup_tx: oneshot::Sender<Result<SetupResult, String>>,
     mut cmd_rx: mpsc::Receiver<Cmd>,
-    activation_id: &Arc<AtomicU32>,
-    barrier_id: &Arc<AtomicU32>,
-    cursor_pos_x: &Arc<AtomicU64>,
-    cursor_pos_y: &Arc<AtomicU64>,
-    activated_queue: &Arc<Mutex<VecDeque<(u32, f64, f64)>>>,
+    shared: &SharedActivation,
     active_edges: Option<Vec<String>>,
 ) -> Result<(), String> {
     // Create portal proxy
@@ -156,9 +158,6 @@ async fn run_portal(
         .map_err(|e| format!("connect_to_eis: {e}"))?;
     let eis_raw_fd = eis_fd.into_raw_fd();
 
-    // enable() must be called by Python after creating the EIS Receiver,
-    // otherwise the compositor handshake has no consumer.
-
     // Send setup results back to Python
     setup_tx
         .send(Ok(SetupResult {
@@ -178,30 +177,21 @@ async fn run_portal(
     loop {
         tokio::select! {
             Some(activated) = activated_stream.next() => {
-                let mut bid_val = 0u32;
-                if let Some(aid) = activated.activation_id() {
-                    activation_id.store(aid, Ordering::Relaxed);
-                }
+                // Write barrier_id and cursor position FIRST (Relaxed).
                 if let Some(ab) = activated.barrier_id() {
                     if let ActivatedBarrier::Barrier(bid) = ab {
-                        bid_val = bid.get();
-                        barrier_id.store(bid_val, Ordering::Relaxed);
+                        shared.barrier_id.store(bid.get(), Ordering::Relaxed);
                     }
                 }
-                let (cx, cy) = if let Some((cx, cy)) = activated.cursor_position() {
-                    let cxf = cx as f64;
-                    let cyf = cy as f64;
-                    cursor_pos_x.store(cxf.to_bits(), Ordering::Relaxed);
-                    cursor_pos_y.store(cyf.to_bits(), Ordering::Relaxed);
-                    (cxf, cyf)
-                } else {
-                    (0.0, 0.0)
-                };
-                // Push to queue so Python can poll the exact activation data
-                if bid_val > 0 {
-                    if let Ok(mut q) = activated_queue.lock() {
-                        q.push_back((bid_val, cx, cy));
-                    }
+                if let Some((cx, cy)) = activated.cursor_position() {
+                    shared.cursor_pos_x.store((cx as f64).to_bits(), Ordering::Relaxed);
+                    shared.cursor_pos_y.store((cy as f64).to_bits(), Ordering::Relaxed);
+                }
+                // Write activation_id LAST with Release ordering.
+                // Python reads it with Acquire, so it is guaranteed to
+                // see the barrier_id and cursor_position written above.
+                if let Some(aid) = activated.activation_id() {
+                    shared.activation_id.store(aid, Ordering::Release);
                 }
             }
             cmd = cmd_rx.recv() => {
@@ -215,7 +205,7 @@ async fn run_portal(
                         reply.send(r).ok();
                     }
                     Some(Cmd::Release { cursor_position, reply }) => {
-                        let aid_val = activation_id.load(Ordering::Relaxed);
+                        let aid_val = shared.activation_id.load(Ordering::Acquire);
                         let aid_opt = if aid_val > 0 { Some(aid_val) } else { None };
                         let r = ic
                             .release(&session, aid_opt, cursor_position)
@@ -249,15 +239,15 @@ fn send_simple_cmd(
 }
 
 /// Wayland InputCapture portal (ashpd).  All methods are blocking.
+///
+/// Activation data is exposed through atomic getters (`activation_id`,
+/// `barrier_id`, `cursor_position`).  `activation_id` is the sequence
+/// number: when it changes, a new barrier was hit.
 #[pyclass]
 struct InputCapturePortal {
     rt: tokio::runtime::Runtime,
     cmd_tx: Option<mpsc::Sender<Cmd>>,
-    activation_id: Arc<AtomicU32>,
-    barrier_id: Arc<AtomicU32>,
-    cursor_pos_x: Arc<AtomicU64>,
-    cursor_pos_y: Arc<AtomicU64>,
-    activated_queue: Arc<Mutex<VecDeque<(u32, f64, f64)>>>,
+    shared: Arc<SharedActivation>,
     zones: Vec<(u32, u32, i32, i32)>,
 }
 
@@ -267,7 +257,7 @@ impl InputCapturePortal {
     #[new]
     fn new() -> PyResult<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(1)
             .enable_all()
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
@@ -275,11 +265,7 @@ impl InputCapturePortal {
         Ok(Self {
             rt,
             cmd_tx: None,
-            activation_id: Arc::new(AtomicU32::new(0)),
-            barrier_id: Arc::new(AtomicU32::new(0)),
-            cursor_pos_x: Arc::new(AtomicU64::new(0)),
-            cursor_pos_y: Arc::new(AtomicU64::new(0)),
-            activated_queue: Arc::new(Mutex::new(VecDeque::new())),
+            shared: Arc::new(SharedActivation::new()),
             zones: Vec::new(),
         })
     }
@@ -297,19 +283,16 @@ impl InputCapturePortal {
 
         let (setup_tx, setup_rx) = oneshot::channel();
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
-        let aid = self.activation_id.clone();
-        let bid = self.barrier_id.clone();
-        let cpx = self.cursor_pos_x.clone();
-        let cpy = self.cursor_pos_y.clone();
-        let aq = self.activated_queue.clone();
+        let shared = self.shared.clone();
 
-        // Clear any stale activations from a previous session
-        if let Ok(mut q) = self.activated_queue.lock() {
-            q.clear();
-        }
+        // Reset atomics for the new session
+        self.shared.reset();
 
-        self.rt
-            .spawn(portal_task(setup_tx, cmd_rx, aid, bid, cpx, cpy, aq, edges));
+        self.rt.spawn(async move {
+            if let Err(e) = run_portal(setup_tx, cmd_rx, &shared, edges).await {
+                eprintln!("pyinputcapture: portal task error: {e}");
+            }
+        });
 
         let result = setup_rx
             .blocking_recv()
@@ -329,30 +312,25 @@ impl InputCapturePortal {
     }
 
     /// Latest activation ID received from the compositor.
+    /// Read with `Acquire` ordering -- if the value changed, the
+    /// corresponding `barrier_id` and `cursor_position` are visible.
     #[getter]
     fn activation_id(&self) -> u32 {
-        self.activation_id.load(Ordering::Relaxed)
+        self.shared.activation_id.load(Ordering::Acquire)
     }
 
     /// Barrier ID from the last Activated signal.
     #[getter]
     fn barrier_id(&self) -> u32 {
-        self.barrier_id.load(Ordering::Relaxed)
+        self.shared.barrier_id.load(Ordering::Relaxed)
     }
 
     /// Cursor position `(x, y)` from the last Activated signal.
     #[getter]
     fn cursor_position(&self) -> (f64, f64) {
-        let x = f64::from_bits(self.cursor_pos_x.load(Ordering::Relaxed));
-        let y = f64::from_bits(self.cursor_pos_y.load(Ordering::Relaxed));
+        let x = f64::from_bits(self.shared.cursor_pos_x.load(Ordering::Relaxed));
+        let y = f64::from_bits(self.shared.cursor_pos_y.load(Ordering::Relaxed));
         (x, y)
-    }
-
-    /// Pop the next Activated event from the queue, or `None` if empty.
-    /// Preferred over the atomic getters because the D-Bus signal may
-    /// arrive after EIS START_EMULATING.
-    fn poll_activated(&self) -> Option<(u32, f64, f64)> {
-        self.activated_queue.lock().ok()?.pop_front()
     }
 
     /// Re-enable capture (barriers become active again).
@@ -403,7 +381,6 @@ impl InputCapturePortal {
     /// Close the session and shut down the background task.
     fn close(&mut self) -> PyResult<()> {
         if let Some(tx) = self.cmd_tx.take() {
-            // Best-effort; task may already be gone.
             tx.blocking_send(Cmd::Close).ok();
         }
         Ok(())
@@ -487,17 +464,60 @@ mod tests {
         }
     }
 
+    // shared activation atomics
+
+    #[test]
+    fn shared_activation_new_is_zero() {
+        let s = SharedActivation::new();
+        assert_eq!(s.activation_id.load(Ordering::Acquire), 0);
+        assert_eq!(s.barrier_id.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn shared_activation_reset() {
+        let s = SharedActivation::new();
+        s.activation_id.store(42, Ordering::Release);
+        s.barrier_id.store(7, Ordering::Relaxed);
+        s.reset();
+        assert_eq!(s.activation_id.load(Ordering::Acquire), 0);
+        assert_eq!(s.barrier_id.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn shared_activation_store_load_ordering() {
+        let s = SharedActivation::new();
+
+        // Simulate the write path: barrier_id + cursor first, activation_id last
+        s.barrier_id.store(3, Ordering::Relaxed);
+        s.cursor_pos_x.store(100.0_f64.to_bits(), Ordering::Relaxed);
+        s.cursor_pos_y.store(200.0_f64.to_bits(), Ordering::Relaxed);
+        s.activation_id.store(1, Ordering::Release);
+
+        // Simulate the read path: activation_id first (Acquire), then the rest
+        let aid = s.activation_id.load(Ordering::Acquire);
+        assert_eq!(aid, 1);
+        assert_eq!(s.barrier_id.load(Ordering::Relaxed), 3);
+        assert_eq!(f64::from_bits(s.cursor_pos_x.load(Ordering::Relaxed)), 100.0);
+        assert_eq!(f64::from_bits(s.cursor_pos_y.load(Ordering::Relaxed)), 200.0);
+    }
+
+    #[test]
+    fn activation_id_zero_means_none() {
+        let s = SharedActivation::new();
+        let val = s.activation_id.load(Ordering::Acquire);
+        let opt = if val > 0 { Some(val) } else { None };
+        assert_eq!(opt, None);
+    }
+
     // channel command flow
 
     #[tokio::test]
     async fn cmd_channel_enable_disable() {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(4);
 
-        // Simulate sending Enable + Disable from "Python side"
         let (reply_tx, reply_rx) = oneshot::channel();
         cmd_tx.send(Cmd::Enable(reply_tx)).await.unwrap();
 
-        // Simulate the portal task handling it
         if let Some(Cmd::Enable(reply)) = cmd_rx.recv().await {
             reply.send(Ok(())).unwrap();
         } else {
@@ -568,7 +588,7 @@ mod tests {
         cmd_tx.send(Cmd::Close).await.unwrap();
 
         match cmd_rx.recv().await {
-            Some(Cmd::Close) => {} // ok
+            Some(Cmd::Close) => {}
             _ => panic!("expected Close"),
         }
     }
@@ -591,37 +611,12 @@ mod tests {
         assert_eq!(result.unwrap_err(), "simulated portal error");
     }
 
-    // activation_id atomic
-
-    #[test]
-    fn activation_id_store_load() {
-        let aid = Arc::new(AtomicU32::new(0));
-
-        assert_eq!(aid.load(Ordering::Relaxed), 0);
-
-        aid.store(42, Ordering::Relaxed);
-        assert_eq!(aid.load(Ordering::Relaxed), 42);
-
-        // Verify the "no activation" check used in run_portal
-        let val = aid.load(Ordering::Relaxed);
-        let opt = if val > 0 { Some(val) } else { None };
-        assert_eq!(opt, Some(42));
-    }
-
-    #[test]
-    fn activation_id_zero_means_none() {
-        let aid = AtomicU32::new(0);
-        let val = aid.load(Ordering::Relaxed);
-        let opt = if val > 0 { Some(val) } else { None };
-        assert_eq!(opt, None);
-    }
-
     // tokio runtime creation
 
     #[test]
     fn tokio_runtime_creates_successfully() {
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(1)
             .enable_all()
             .build();
         assert!(rt.is_ok());
