@@ -536,101 +536,6 @@ impl Drop for InputCapturePortal {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // (width, height, x_offset, y_offset)
-    const SINGLE: [(u32, u32, i32, i32); 1] = [(1920, 1080, 0, 0)];
-    const DUAL: [(u32, u32, i32, i32); 2] = [(1920, 1080, 0, 0), (1280, 1024, 1920, 0)];
-
-    fn edges_of(map: &[(u32, String)]) -> Vec<&str> {
-        map.iter().map(|(_, e)| e.as_str()).collect()
-    }
-
-    #[test]
-    fn all_edges_when_unfiltered() {
-        let (barriers, map) = build_barriers(&SINGLE, None);
-        assert_eq!(barriers.len(), 4);
-        assert_eq!(edges_of(&map), ["top", "bottom", "left", "right"]);
-    }
-
-    #[test]
-    fn only_requested_edges_are_armed() {
-        let (barriers, map) = build_barriers(&SINGLE, Some(&["right".to_string()]));
-        assert_eq!(barriers.len(), 1, "an unbound edge must not hold the pointer");
-        assert_eq!(edges_of(&map), ["right"]);
-    }
-
-    #[test]
-    fn no_edges_means_no_barriers() {
-        let (barriers, map) = build_barriers(&SINGLE, Some(&[]));
-        assert!(barriers.is_empty(), "the whole border must stay reachable");
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn barrier_ids_are_unique_and_nonzero_across_zones() {
-        let (_, map) = build_barriers(&DUAL, None);
-        assert_eq!(map.len(), 8, "four edges per zone");
-        let mut ids: Vec<u32> = map.iter().map(|(id, _)| *id).collect();
-        let count = ids.len();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), count, "duplicate barrier ids would alias edges");
-        assert!(ids.iter().all(|id| *id != 0), "0 is not a valid barrier id");
-    }
-
-    #[test]
-    fn ids_are_stable_for_the_same_filter() {
-        let (_, a) = build_barriers(&DUAL, Some(&["left".to_string()]));
-        let (_, b) = build_barriers(&DUAL, Some(&["left".to_string()]));
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn segments_are_built_verbatim_and_labelled() {
-        let segments = vec![
-            ("left".to_string(), 0, 300, 0, 800),
-            ("top".to_string(), 100, 0, 900, 0),
-        ];
-        let (barriers, map) = build_segment_barriers(&segments);
-        assert_eq!(barriers.len(), 2);
-        assert_eq!(edges_of(&map), ["left", "top"]);
-        assert!(map.iter().all(|(id, _)| *id != 0));
-    }
-
-    #[test]
-    fn segments_reject_non_axis_aligned_without_dropping_the_rest() {
-        // A diagonal would make the portal reject the whole SetPointerBarriers
-        // call, so it is skipped and its neighbours still get armed.
-        let segments = vec![
-            ("left".to_string(), 0, 0, 0, 500),
-            ("diagonal".to_string(), 0, 0, 500, 500),
-            ("right".to_string(), 1920, 0, 1920, 500),
-        ];
-        let (barriers, map) = build_segment_barriers(&segments);
-        assert_eq!(barriers.len(), 2);
-        assert_eq!(edges_of(&map), ["left", "right"]);
-    }
-
-    #[test]
-    fn a_single_point_segment_is_accepted() {
-        // Degenerate but axis-aligned: a one-pixel-tall placement. Valid, and
-        // dropping it would silently lose a real (if tiny) crossing.
-        let segments = vec![("left".to_string(), 0, 42, 0, 42)];
-        let (barriers, _) = build_segment_barriers(&segments);
-        assert_eq!(barriers.len(), 1);
-    }
-
-    #[test]
-    fn empty_segments_arm_nothing() {
-        let (barriers, map) = build_segment_barriers(&[]);
-        assert!(barriers.is_empty());
-        assert!(map.is_empty());
-    }
-}
-
 #[pymodule]
 fn pyinputcapture(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<InputCapturePortal>()?;
@@ -697,6 +602,120 @@ mod tests {
         for (i, (bid, _)) in barrier_map.iter().enumerate() {
             assert_eq!(*bid, (i as u32) + 1);
         }
+    }
+
+    #[test]
+    fn barriers_no_edges_arms_nothing() {
+        // An empty filter must not fall through to "all edges": with no client
+        // anywhere the whole screen border has to stay reachable.
+        let zones = vec![(1920, 1080, 0, 0)];
+        let (barriers, barrier_map) = build_barriers(&zones, Some(&[]));
+
+        assert!(barriers.is_empty());
+        assert!(barrier_map.is_empty());
+    }
+
+    #[test]
+    fn barriers_ids_stable_across_identical_calls() {
+        // set_barriers re-issues these on a live session, so an id must keep
+        // meaning the same edge - the barrier_map is how an activation is
+        // resolved back to an edge.
+        let zones = vec![(1920, 1080, 0, 0), (1280, 1024, 1920, 0)];
+        let edges = vec!["left".to_string()];
+        let (_, a) = build_barriers(&zones, Some(&edges));
+        let (_, b) = build_barriers(&zones, Some(&edges));
+
+        assert_eq!(a, b);
+    }
+
+    // build_segment_barriers
+
+    #[test]
+    fn segments_are_built_verbatim_and_labelled() {
+        let segments = vec![
+            ("left".to_string(), 0, 300, 0, 800),
+            ("top".to_string(), 100, 0, 900, 0),
+        ];
+        let (barriers, barrier_map) = build_segment_barriers(&segments);
+
+        assert_eq!(barriers.len(), 2);
+        assert_eq!(barrier_map[0].1, "left");
+        assert_eq!(barrier_map[1].1, "top");
+        assert!(barrier_map.iter().all(|(bid, _)| *bid != 0));
+    }
+
+    #[test]
+    fn segments_partial_edge_is_shorter_than_the_zone_edge() {
+        // The whole point: a client abutting only part of an edge must not
+        // arm a barrier along the rest of it.
+        let zones = vec![(1920, 1080, 0, 0)];
+        let (whole_edge, _) = build_barriers(&zones, Some(&["left".to_string()]));
+        let (partial, map) =
+            build_segment_barriers(&[("left".to_string(), 0, 300, 0, 800)]);
+
+        assert_eq!(whole_edge.len(), 1);
+        assert_eq!(partial.len(), 1);
+        assert_eq!(map[0].1, "left");
+    }
+
+    #[test]
+    fn segments_skip_non_axis_aligned_without_dropping_the_rest() {
+        // A diagonal makes the portal reject the entire SetPointerBarriers
+        // call, so it is dropped here and its valid neighbours survive.
+        let segments = vec![
+            ("left".to_string(), 0, 0, 0, 500),
+            ("diagonal".to_string(), 0, 0, 500, 500),
+            ("right".to_string(), 1920, 0, 1920, 500),
+        ];
+        let (barriers, barrier_map) = build_segment_barriers(&segments);
+
+        assert_eq!(barriers.len(), 2);
+        assert_eq!(barrier_map[0].1, "left");
+        assert_eq!(barrier_map[1].1, "right");
+    }
+
+    #[test]
+    fn segments_single_point_is_accepted() {
+        // Degenerate but axis-aligned (a one-pixel placement). Dropping it
+        // would silently lose a real, if tiny, crossing.
+        let (barriers, _) = build_segment_barriers(&[("left".to_string(), 0, 42, 0, 42)]);
+        assert_eq!(barriers.len(), 1);
+    }
+
+    #[test]
+    fn segments_empty_arms_nothing() {
+        let (barriers, barrier_map) = build_segment_barriers(&[]);
+        assert!(barriers.is_empty());
+        assert!(barrier_map.is_empty());
+    }
+
+    #[test]
+    fn segments_ids_are_sequential_and_nonzero() {
+        let segments = vec![
+            ("left".to_string(), 0, 0, 0, 100),
+            ("left".to_string(), 0, 200, 0, 300),
+            ("top".to_string(), 0, 0, 100, 0),
+        ];
+        let (_, barrier_map) = build_segment_barriers(&segments);
+
+        for (i, (bid, _)) in barrier_map.iter().enumerate() {
+            assert_eq!(*bid, (i as u32) + 1);
+        }
+    }
+
+    #[test]
+    fn segments_allow_several_disjoint_spans_on_one_edge() {
+        // Two clients stacked against the same edge, with a gap between them:
+        // the gap must stay barrier-free.
+        let segments = vec![
+            ("left".to_string(), 0, 0, 0, 300),
+            ("left".to_string(), 0, 700, 0, 1000),
+        ];
+        let (barriers, barrier_map) = build_segment_barriers(&segments);
+
+        assert_eq!(barriers.len(), 2);
+        assert!(barrier_map.iter().all(|(_, name)| name == "left"));
+        assert_ne!(barrier_map[0].0, barrier_map[1].0);
     }
 
     // shared activation atomics
