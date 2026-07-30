@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 from typing import Optional
 
 from pyinputcapture.pyinputcapture import InputCapturePortal
@@ -38,10 +39,15 @@ class AsyncInputCapturePortal:
         await loop.run_in_executor(None, self._portal.disable)
 
     async def set_barriers(
-        self, edges: Optional[list[str]] = None
+        self,
+        edges: Optional[list[str]] = None,
+        *,
+        segments: Optional[list[tuple[str, int, int, int, int]]] = None,
     ) -> list[tuple[int, str]]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._portal.set_barriers, edges)
+        return await loop.run_in_executor(
+            None, partial(self._portal.set_barriers, edges, segments=segments)
+        )
 
     async def release(
         self,

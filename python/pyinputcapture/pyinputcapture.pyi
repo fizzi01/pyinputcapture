@@ -42,8 +42,17 @@ class InputCapturePortal:
         """Re-enable capture (barriers become active again)."""
         ...
 
-    def set_barriers(self, edges: list[str] | None = None) -> list[tuple[int, str]]:
+    def set_barriers(
+        self,
+        edges: list[str] | None = None,
+        *,
+        segments: list[tuple[str, int, int, int, int]] | None = None,
+    ) -> list[tuple[int, str]]:
         """Replace the armed pointer barriers on the existing session.
+
+        Pass either `edges` (whole zone edges by name, None = all of them) or
+        `segments` ((label, x1, y1, x2, y2) axis-aligned lines in absolute
+        desktop coordinates, for an edge only partly abutted) — not both.
 
         Returns the new barrier_map, minus any barrier the compositor
         rejected. Reuses the current session (re-running setup hangs the

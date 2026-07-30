@@ -78,6 +78,63 @@ class TestClose:
             portal.enable()
 
 
+class TestSetBarriers:
+    """``set_barriers`` re-arms barriers on a live session.
+
+    Without a compositor only the argument handling is reachable, which is
+    still the part a caller can get wrong. The barrier geometry itself is
+    covered by the Rust unit tests for ``build_segment_barriers``.
+    """
+
+    def test_exists(self):
+        portal = InputCapturePortal()
+        assert hasattr(portal, "set_barriers")
+
+    def test_raises_when_not_set_up(self):
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError, match="not set up"):
+            portal.set_barriers(["left"])
+
+    def test_no_args_raises_when_not_set_up(self):
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError, match="not set up"):
+            portal.set_barriers()
+
+    def test_empty_edges_raises_when_not_set_up(self):
+        # An empty list means "arm nothing", a legitimate request that must
+        # not be confused with None ("arm every edge").
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError, match="not set up"):
+            portal.set_barriers([])
+
+    def test_segments_keyword_raises_when_not_set_up(self):
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError, match="not set up"):
+            portal.set_barriers(segments=[("left", 0, 300, 0, 800)])
+
+    def test_segments_is_keyword_only(self):
+        portal = InputCapturePortal()
+        with pytest.raises(TypeError):
+            portal.set_barriers(["left"], [("left", 0, 0, 0, 100)])
+
+    def test_edges_and_segments_together_rejected(self):
+        # Checked before the "not set up" guard, so it surfaces even here.
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError, match="not both"):
+            portal.set_barriers(["left"], segments=[("left", 0, 0, 0, 100)])
+
+    def test_malformed_segment_raises_typeerror(self):
+        portal = InputCapturePortal()
+        with pytest.raises(TypeError):
+            portal.set_barriers(segments=[("left", 0, 300)])
+
+    def test_after_close_raises_not_set_up(self):
+        portal = InputCapturePortal()
+        portal.close()
+        with pytest.raises(RuntimeError, match="not set up"):
+            portal.set_barriers(["left"])
+
+
 class TestSetupNoBus:
     @pytest.mark.skipif(
         sys.platform != "linux",
