@@ -14,6 +14,7 @@ use std::num::NonZeroU32;
 use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ashpd::desktop::input_capture::{ActivatedBarrier, Barrier, Capabilities, InputCapture};
 use futures_util::StreamExt;
@@ -50,6 +51,7 @@ enum BarrierSpec {
     Segments(Vec<(String, i32, i32, i32, i32)>),
 }
 
+#[derive(Debug)]
 struct SetupResult {
     zones: Vec<(u32, u32, i32, i32)>,
     eis_raw_fd: i32,
@@ -148,8 +150,34 @@ fn build_segment_barriers(
     (barriers, barrier_map)
 }
 
+/// Run the portal session, guaranteeing Python hears about a setup failure.
+///
+/// Every step of the setup phase exits via `?`, which used to drop `setup_tx`
+/// without sending — so the caller could only ever report the generic
+/// "portal setup channel closed" while the real reason (a denied permission
+/// dialog, a missing portal) went to stderr and was typically discarded. The
+/// sender is threaded through as an `Option` that `portal_session` takes when it
+/// succeeds, so exactly one of the two paths answers: `Ok` from inside, `Err`
+/// from here.
 async fn run_portal(
     setup_tx: oneshot::Sender<Result<SetupResult, String>>,
+    cmd_rx: mpsc::Receiver<Cmd>,
+    shared: &SharedActivation,
+    active_edges: Option<Vec<String>>,
+) -> Result<(), String> {
+    let mut setup_tx = Some(setup_tx);
+    let result = portal_session(&mut setup_tx, cmd_rx, shared, active_edges).await;
+    if let Err(e) = &result {
+        // Still Some ⇒ we failed before handing the session over.
+        if let Some(tx) = setup_tx.take() {
+            tx.send(Err(e.clone())).ok();
+        }
+    }
+    result
+}
+
+async fn portal_session(
+    setup_tx: &mut Option<oneshot::Sender<Result<SetupResult, String>>>,
     mut cmd_rx: mpsc::Receiver<Cmd>,
     shared: &SharedActivation,
     active_edges: Option<Vec<String>>,
@@ -159,7 +187,9 @@ async fn run_portal(
         .await
         .map_err(|e| format!("InputCapture::new: {e}"))?;
 
-    // Create session
+    // Create session. On GNOME this is what raises the permission dialog, so it
+    // stays pending for as long as the user takes to answer it - which is why the
+    // Python caller must not be holding the GIL while it runs.
     let (session, _caps) = ic
         .create_session(
             None::<&ashpd::WindowIdentifier>,
@@ -211,6 +241,8 @@ async fn run_portal(
 
     // Send setup results back to Python
     setup_tx
+        .take()
+        .ok_or_else(|| "setup already reported".to_string())?
         .send(Ok(SetupResult {
             zones,
             eis_raw_fd,
@@ -312,20 +344,32 @@ async fn run_portal(
     Ok(())
 }
 
+/// Send a command and wait for its reply **with the GIL released**.
+///
+/// Every one of these round trips can block for an unbounded time: the portal
+/// task may be parked on a D-Bus reply, and `create_session` in particular waits
+/// for a human to answer a permission dialog. Holding the GIL across that froze
+/// the caller's entire interpreter - no event loop, no logging, no shutdown - so
+/// `allow_threads` here is load-bearing, not an optimisation.
 fn send_simple_cmd(
+    py: Python<'_>,
     tx: &mpsc::Sender<Cmd>,
-    make: impl FnOnce(oneshot::Sender<Result<(), String>>) -> Cmd,
+    make: impl FnOnce(oneshot::Sender<Result<(), String>>) -> Cmd + Send,
 ) -> PyResult<()> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    tx.blocking_send(make(reply_tx))
-        .map_err(|_| PyRuntimeError::new_err("portal task not running"))?;
-    reply_rx
-        .blocking_recv()
-        .map_err(|_| PyRuntimeError::new_err("portal task dropped reply"))?
-        .map_err(PyRuntimeError::new_err)
+    py.allow_threads(|| {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.blocking_send(make(reply_tx))
+            .map_err(|_| PyRuntimeError::new_err("portal task not running"))?;
+        reply_rx
+            .blocking_recv()
+            .map_err(|_| PyRuntimeError::new_err("portal task dropped reply"))?
+            .map_err(PyRuntimeError::new_err)
+    })
 }
 
-/// Wayland InputCapture portal (ashpd).  All methods are blocking.
+/// Wayland InputCapture portal (ashpd).  All methods are blocking, but they
+/// release the GIL while they wait (see `send_simple_cmd`), so a Python program
+/// stays responsive even while a permission dialog is on screen.
 ///
 /// Activation data is exposed through atomic getters (`activation_id`,
 /// `barrier_id`, `cursor_position`).  `activation_id` is the sequence
@@ -359,10 +403,18 @@ impl InputCapturePortal {
 
     /// Create session, set barriers, connect to EIS.
     /// Returns `(zones, eis_fd, barrier_map)`.
-    #[pyo3(signature = (edges=None))]
+    ///
+    /// Blocks until the portal answers — which on GNOME means until the user
+    /// answers the permission dialog — but **releases the GIL while it waits**, so
+    /// the calling program keeps running. `timeout` (seconds, default 120) bounds
+    /// that wait so an ignored dialog fails cleanly instead of pinning the thread
+    /// forever; pass `None` to wait indefinitely.
+    #[pyo3(signature = (edges=None, timeout=120.0))]
     fn setup(
         &mut self,
+        py: Python<'_>,
         edges: Option<Vec<String>>,
+        timeout: Option<f64>,
     ) -> PyResult<(Vec<(u32, u32, i32, i32)>, i32, Vec<(u32, String)>)> {
         if self.cmd_tx.is_some() {
             return Err(PyRuntimeError::new_err("already set up"));
@@ -381,10 +433,24 @@ impl InputCapturePortal {
             }
         });
 
-        let result = setup_rx
-            .blocking_recv()
+        let handle = self.rt.handle().clone();
+        let result = py.allow_threads(|| -> PyResult<SetupResult> {
+            match timeout {
+                Some(secs) if secs > 0.0 => handle
+                    .block_on(async {
+                        tokio::time::timeout(Duration::from_secs_f64(secs), setup_rx).await
+                    })
+                    .map_err(|_| {
+                        PyRuntimeError::new_err(format!(
+                            "portal setup timed out after {secs}s \
+                             (permission dialog unanswered?)"
+                        ))
+                    })?,
+                _ => setup_rx.blocking_recv(),
+            }
             .map_err(|_| PyRuntimeError::new_err("portal setup channel closed"))?
-            .map_err(PyRuntimeError::new_err)?;
+            .map_err(PyRuntimeError::new_err)
+        })?;
 
         self.cmd_tx = Some(cmd_tx);
         self.zones = result.zones.clone();
@@ -421,12 +487,12 @@ impl InputCapturePortal {
     }
 
     /// Re-enable capture (barriers become active again).
-    fn enable(&self) -> PyResult<()> {
+    fn enable(&self, py: Python<'_>) -> PyResult<()> {
         let tx = self
             .cmd_tx
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("not set up"))?;
-        send_simple_cmd(tx, Cmd::Enable)
+        send_simple_cmd(py, tx, Cmd::Enable)
     }
 
     /// Replace the armed pointer barriers on the existing session.
@@ -450,6 +516,7 @@ impl InputCapturePortal {
     #[pyo3(signature = (edges=None, *, segments=None))]
     fn set_barriers(
         &self,
+        py: Python<'_>,
         edges: Option<Vec<String>>,
         segments: Option<Vec<(String, i32, i32, i32, i32)>>,
     ) -> PyResult<Vec<(u32, String)>> {
@@ -469,32 +536,39 @@ impl InputCapturePortal {
             None => BarrierSpec::Edges(edges),
         };
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        tx.blocking_send(Cmd::SetBarriers {
-            spec,
-            reply: reply_tx,
-        })
-        .map_err(|_| PyRuntimeError::new_err("portal task not running"))?;
+        py.allow_threads(|| {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.blocking_send(Cmd::SetBarriers {
+                spec,
+                reply: reply_tx,
+            })
+            .map_err(|_| PyRuntimeError::new_err("portal task not running"))?;
 
-        reply_rx
-            .blocking_recv()
-            .map_err(|_| PyRuntimeError::new_err("portal task dropped reply"))?
-            .map_err(PyRuntimeError::new_err)
+            reply_rx
+                .blocking_recv()
+                .map_err(|_| PyRuntimeError::new_err("portal task dropped reply"))?
+                .map_err(PyRuntimeError::new_err)
+        })
     }
 
     /// Disable capture (barriers deactivated).
-    fn disable(&self) -> PyResult<()> {
+    fn disable(&self, py: Python<'_>) -> PyResult<()> {
         let tx = self
             .cmd_tx
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("not set up"))?;
-        send_simple_cmd(tx, Cmd::Disable)
+        send_simple_cmd(py, tx, Cmd::Disable)
     }
 
     /// Release captured input.  Optional `cursor_x`/`cursor_y` reposition
     /// the cursor on release (absolute desktop coordinates).
     #[pyo3(signature = (cursor_x=None, cursor_y=None))]
-    fn release(&self, cursor_x: Option<f64>, cursor_y: Option<f64>) -> PyResult<()> {
+    fn release(
+        &self,
+        py: Python<'_>,
+        cursor_x: Option<f64>,
+        cursor_y: Option<f64>,
+    ) -> PyResult<()> {
         let tx = self
             .cmd_tx
             .as_ref()
@@ -505,23 +579,30 @@ impl InputCapturePortal {
             _ => None,
         };
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        tx.blocking_send(Cmd::Release {
-            cursor_position,
-            reply: reply_tx,
-        })
-        .map_err(|_| PyRuntimeError::new_err("portal task not running"))?;
+        py.allow_threads(|| {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.blocking_send(Cmd::Release {
+                cursor_position,
+                reply: reply_tx,
+            })
+            .map_err(|_| PyRuntimeError::new_err("portal task not running"))?;
 
-        reply_rx
-            .blocking_recv()
-            .map_err(|_| PyRuntimeError::new_err("portal task dropped reply"))?
-            .map_err(PyRuntimeError::new_err)
+            reply_rx
+                .blocking_recv()
+                .map_err(|_| PyRuntimeError::new_err("portal task dropped reply"))?
+                .map_err(PyRuntimeError::new_err)
+        })
     }
 
     /// Close the session and shut down the background task.
+    ///
+    /// Does not wait for the portal task to acknowledge: this is called from
+    /// teardown paths where the task may be parked on a D-Bus reply that will
+    /// never arrive, and blocking there (with or without the GIL) is how a
+    /// shutdown turns into a hang. `try_send` is enough to ask it to stop.
     fn close(&mut self) -> PyResult<()> {
         if let Some(tx) = self.cmd_tx.take() {
-            tx.blocking_send(Cmd::Close).ok();
+            tx.try_send(Cmd::Close).ok();
         }
         Ok(())
     }
@@ -532,6 +613,17 @@ impl Drop for InputCapturePortal {
         if let Some(tx) = self.cmd_tx.take() {
             // try_send avoids panic if called from within the tokio runtime.
             tx.try_send(Cmd::Close).ok();
+        }
+        // Dropping a multi-threaded Runtime blocks until its workers wind down,
+        // and a worker awaiting a portal reply may never finish - which, during
+        // Python GC with the GIL held, freezes the whole interpreter. Hand the
+        // runtime to a background thread to wind down on its own instead.
+        //
+        // Replace the runtime with a throwaway current-thread one (which has
+        // nothing to wind down) so we can move the real one out of &mut self.
+        if let Ok(placeholder) = tokio::runtime::Builder::new_current_thread().build() {
+            let rt = std::mem::replace(&mut self.rt, placeholder);
+            rt.shutdown_background();
         }
     }
 }
@@ -716,6 +808,98 @@ mod tests {
         assert_eq!(barriers.len(), 2);
         assert!(barrier_map.iter().all(|(_, name)| name == "left"));
         assert_ne!(barrier_map[0].0, barrier_map[1].0);
+    }
+
+    // setup-result plumbing
+    //
+    // The contract these pin: a setup failure must reach Python as the *real*
+    // reason. Every step of the setup phase exits via `?`, which used to drop
+    // `setup_tx` unsent, so the caller could only report "portal setup channel
+    // closed" while the actual cause went to stderr.
+
+    /// Stand-in for `portal_session`'s use of the sender: takes it on success,
+    /// leaves it in place on failure so the wrapper can report the error.
+    fn fake_session(
+        setup_tx: &mut Option<oneshot::Sender<Result<SetupResult, String>>>,
+        fail_at_step: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(step) = fail_at_step {
+            return Err(format!("{step}: boom"));
+        }
+        setup_tx
+            .take()
+            .ok_or_else(|| "setup already reported".to_string())?
+            .send(Ok(SetupResult {
+                zones: vec![(1920, 1080, 0, 0)],
+                eis_raw_fd: 7,
+                barrier_map: vec![(1, "left".to_string())],
+            }))
+            .map_err(|_| "setup result channel closed".to_string())
+    }
+
+    /// Mirrors `run_portal`'s wrapper: report an error only if unreported.
+    fn fake_run(
+        setup_tx: oneshot::Sender<Result<SetupResult, String>>,
+        fail_at_step: Option<&str>,
+    ) -> Result<(), String> {
+        let mut slot = Some(setup_tx);
+        let result = fake_session(&mut slot, fail_at_step);
+        if let Err(e) = &result {
+            if let Some(tx) = slot.take() {
+                tx.send(Err(e.clone())).ok();
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn setup_failure_reports_the_real_reason() {
+        let (tx, rx) = oneshot::channel();
+        assert!(fake_run(tx, Some("create_session")).is_err());
+
+        // Not a bare channel-closed: the cause survives the hop to Python.
+        let err = rx.blocking_recv().expect("sender must not be dropped unsent");
+        assert_eq!(err.unwrap_err(), "create_session: boom");
+    }
+
+    #[test]
+    fn setup_success_delivers_the_result() {
+        let (tx, rx) = oneshot::channel();
+        assert!(fake_run(tx, None).is_ok());
+
+        let result = rx.blocking_recv().unwrap().unwrap();
+        assert_eq!(result.eis_raw_fd, 7);
+        assert_eq!(result.zones, vec![(1920, 1080, 0, 0)]);
+    }
+
+    #[test]
+    fn setup_is_reported_exactly_once() {
+        // A failure *after* the session was handed over must not try to send a
+        // second time - Python already has its Ok.
+        let (tx, rx) = oneshot::channel();
+        let mut slot = Some(tx);
+        fake_session(&mut slot, None).unwrap();
+        assert!(slot.is_none(), "the sender is consumed by the success path");
+
+        assert!(rx.blocking_recv().unwrap().is_ok());
+    }
+
+    #[test]
+    fn setup_timeout_is_an_error_not_a_hang() {
+        // Nothing ever answers: the bounded wait must give up. This is the
+        // unanswered-permission-dialog case.
+        let (_tx, rx) = oneshot::channel::<Result<SetupResult, String>>();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let timed_out = rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(50), rx)
+                .await
+                .is_err()
+        });
+        assert!(timed_out);
     }
 
     // shared activation atomics

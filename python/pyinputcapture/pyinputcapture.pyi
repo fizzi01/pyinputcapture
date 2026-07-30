@@ -26,11 +26,17 @@ class InputCapturePortal:
         ...
 
     def setup(
-        self, edges: list[str] | None = None
+        self,
+        edges: list[str] | None = None,
+        timeout: float | None = 120.0,
     ) -> tuple[list[tuple[int, int, int, int]], int, list[tuple[int, str]]]:
         """Create session, set barriers, connect to EIS.
 
         Returns (zones, eis_fd, barrier_map).
+
+        Blocks until the portal answers — on GNOME, until the user answers the
+        permission dialog — but releases the GIL while waiting. `timeout`
+        (seconds) bounds that wait; pass None to wait indefinitely.
         """
         ...
 

@@ -136,15 +136,52 @@ class TestSetBarriers:
 
 
 class TestSetupNoBus:
+    @pytest.fixture(autouse=True)
+    def _no_session_bus(self, monkeypatch):
+        # Every test in here calls setup(). Without this the calls would reach a
+        # real portal on a desktop session and pop a permission dialog mid-suite.
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+
     @pytest.mark.skipif(
         sys.platform != "linux",
         reason="InputCapture portal only works on Linux",
     )
-    def test_setup_without_dbus_raises(self, monkeypatch):
-        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    def test_setup_without_dbus_raises(self):
         portal = InputCapturePortal()
         with pytest.raises(RuntimeError):
             portal.setup()
+
+    @pytest.mark.skipif(
+        sys.platform != "linux",
+        reason="InputCapture portal only works on Linux",
+    )
+    def test_setup_failure_names_the_failing_step(self):
+        """The reason must survive the hop back to Python.
+
+        Every setup step exits via `?`, which used to drop the result sender
+        unsent — leaving only the generic "portal setup channel closed" while the
+        real cause went to stderr and was usually discarded.
+        """
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError) as excinfo:
+            portal.setup()
+        assert "channel closed" not in str(excinfo.value)
+
+    def test_setup_accepts_a_positional_timeout(self):
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError):
+            portal.setup(None, 0.25)
+
+    def test_setup_accepts_timeout_by_keyword(self):
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError):
+            portal.setup(edges=["left"], timeout=0.25)
+
+    def test_setup_accepts_none_timeout(self):
+        # None means "wait indefinitely"; with no bus it still fails fast.
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError):
+            portal.setup(["left"], None)
 
     def test_double_setup_raises(self):
         # Can't complete setup without a compositor; documents intent.

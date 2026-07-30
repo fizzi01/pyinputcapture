@@ -26,9 +26,15 @@ class AsyncInputCapturePortal:
     def activation_id(self) -> int:
         return self._portal.activation_id
 
-    async def setup(self) -> tuple[list[tuple[int, int, int, int]], int]:
+    async def setup(
+        self,
+        edges: Optional[list[str]] = None,
+        timeout: Optional[float] = 120.0,
+    ) -> tuple[list[tuple[int, int, int, int]], int, list[tuple[int, str]]]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._portal.setup)
+        return await loop.run_in_executor(
+            None, partial(self._portal.setup, edges, timeout)
+        )
 
     async def enable(self) -> None:
         loop = asyncio.get_running_loop()
