@@ -25,10 +25,10 @@ enum Cmd {
     Enable(oneshot::Sender<Result<(), String>>),
     Disable(oneshot::Sender<Result<(), String>>),
     /// Re-issue SetPointerBarriers on the *existing* session, so the set of
-    /// armed edges can change without a CreateSession round trip (recreating
-    /// the session is what hangs the GNOME portal).
+    /// armed barriers can change without a CreateSession round trip
+    /// (recreating the session is what hangs the GNOME portal).
     SetBarriers {
-        active_edges: Option<Vec<String>>,
+        spec: BarrierSpec,
         reply: oneshot::Sender<Result<Vec<(u32, String)>, String>>,
     },
     Release {
@@ -36,6 +36,18 @@ enum Cmd {
         reply: oneshot::Sender<Result<(), String>>,
     },
     Close,
+}
+
+/// How the caller wants barriers described.
+///
+/// `Edges` covers whole zone edges by name. `Segments` names explicit lines in
+/// absolute desktop coordinates, which is the only way to express an edge a
+/// client abuts only *part* of - an armed barrier holds the pointer, so
+/// covering the unbound remainder of an edge would stop the cursor short of
+/// the real screen border where there is nothing to cross to.
+enum BarrierSpec {
+    Edges(Option<Vec<String>>),
+    Segments(Vec<(String, i32, i32, i32, i32)>),
 }
 
 struct SetupResult {
@@ -104,6 +116,35 @@ fn build_barriers(
             }
         }
     }
+    (barriers, barrier_map)
+}
+
+/// Build barriers from explicit line segments in absolute desktop coordinates.
+///
+/// Each entry is `(label, x1, y1, x2, y2)`; the label is what comes back in the
+/// barrier map, so the caller can tell which edge an activation belongs to.
+/// Degenerate entries (neither horizontal nor vertical) are skipped: the portal
+/// spec only accepts axis-aligned barriers, and a diagonal would be rejected
+/// wholesale, taking the valid barriers of the same call down with it.
+fn build_segment_barriers(
+    segments: &[(String, i32, i32, i32, i32)],
+) -> (Vec<Barrier>, Vec<(u32, String)>) {
+    let mut barriers = Vec::with_capacity(segments.len());
+    let mut barrier_map = Vec::with_capacity(segments.len());
+    let mut bid: u32 = 1;
+
+    for (label, x1, y1, x2, y2) in segments {
+        if x1 != x2 && y1 != y2 {
+            eprintln!("pyinputcapture: skipping non-axis-aligned barrier {label:?}");
+            continue;
+        }
+        if let Some(barrier_id) = NonZeroU32::new(bid) {
+            barriers.push(Barrier::new(barrier_id, (*x1, *y1, *x2, *y2)));
+            barrier_map.push((bid, label.clone()));
+        }
+        bid += 1;
+    }
+
     (barriers, barrier_map)
 }
 
@@ -214,9 +255,15 @@ async fn run_portal(
                         let r = ic.disable(&session).await.map_err(|e| e.to_string());
                         reply.send(r).ok();
                     }
-                    Some(Cmd::SetBarriers { active_edges, reply }) => {
-                        let (new_barriers, new_map) =
-                            build_barriers(&zone_geometry, active_edges.as_deref());
+                    Some(Cmd::SetBarriers { spec, reply }) => {
+                        let (new_barriers, new_map) = match &spec {
+                            BarrierSpec::Edges(edges) => {
+                                build_barriers(&zone_geometry, edges.as_deref())
+                            }
+                            BarrierSpec::Segments(segments) => {
+                                build_segment_barriers(segments)
+                            }
+                        };
                         let r = match ic
                             .set_pointer_barriers(&session, &new_barriers, zone_set)
                             .await
@@ -384,26 +431,47 @@ impl InputCapturePortal {
 
     /// Replace the armed pointer barriers on the existing session.
     ///
-    /// `edges` is the same filter `setup` takes (`None` = all four edges of
-    /// every zone).  Returns the new `barrier_map`, with any barrier the
-    /// compositor rejected already removed.
+    /// Two forms, and they are mutually exclusive:
     ///
-    /// This exists so the caller can arm barriers *only* on edges that
-    /// actually lead somewhere: an armed barrier stops the pointer at the
-    /// screen edge, so arming all four means the cursor can never reach the
-    /// real border on edges with nothing behind them.  It reuses the current
-    /// session deliberately -- re-running `setup` is what hangs the GNOME
-    /// portal.
-    #[pyo3(signature = (edges=None))]
-    fn set_barriers(&self, edges: Option<Vec<String>>) -> PyResult<Vec<(u32, String)>> {
+    /// * `edges` -- the same whole-edge filter `setup` takes (`None` = all four
+    ///   edges of every zone).
+    /// * `segments` -- explicit `(label, x1, y1, x2, y2)` lines in absolute
+    ///   desktop coordinates, for when a client abuts only *part* of an edge.
+    ///   Must be axis-aligned; the label is echoed back in the barrier map.
+    ///
+    /// Returns the new `barrier_map`, with any barrier the compositor rejected
+    /// already removed.
+    ///
+    /// This exists so the caller can arm barriers *only* where they lead
+    /// somewhere: an armed barrier stops the pointer, so arming a whole edge
+    /// means the cursor can never reach the real border along the parts with
+    /// nothing behind them.  It reuses the current session deliberately --
+    /// re-running `setup` is what hangs the GNOME portal.
+    #[pyo3(signature = (edges=None, *, segments=None))]
+    fn set_barriers(
+        &self,
+        edges: Option<Vec<String>>,
+        segments: Option<Vec<(String, i32, i32, i32, i32)>>,
+    ) -> PyResult<Vec<(u32, String)>> {
+        if edges.is_some() && segments.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "pass either edges or segments, not both",
+            ));
+        }
+
         let tx = self
             .cmd_tx
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("not set up"))?;
 
+        let spec = match segments {
+            Some(s) => BarrierSpec::Segments(s),
+            None => BarrierSpec::Edges(edges),
+        };
+
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.blocking_send(Cmd::SetBarriers {
-            active_edges: edges,
+            spec,
             reply: reply_tx,
         })
         .map_err(|_| PyRuntimeError::new_err("portal task not running"))?;
@@ -465,6 +533,101 @@ impl Drop for InputCapturePortal {
             // try_send avoids panic if called from within the tokio runtime.
             tx.try_send(Cmd::Close).ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // (width, height, x_offset, y_offset)
+    const SINGLE: [(u32, u32, i32, i32); 1] = [(1920, 1080, 0, 0)];
+    const DUAL: [(u32, u32, i32, i32); 2] = [(1920, 1080, 0, 0), (1280, 1024, 1920, 0)];
+
+    fn edges_of(map: &[(u32, String)]) -> Vec<&str> {
+        map.iter().map(|(_, e)| e.as_str()).collect()
+    }
+
+    #[test]
+    fn all_edges_when_unfiltered() {
+        let (barriers, map) = build_barriers(&SINGLE, None);
+        assert_eq!(barriers.len(), 4);
+        assert_eq!(edges_of(&map), ["top", "bottom", "left", "right"]);
+    }
+
+    #[test]
+    fn only_requested_edges_are_armed() {
+        let (barriers, map) = build_barriers(&SINGLE, Some(&["right".to_string()]));
+        assert_eq!(barriers.len(), 1, "an unbound edge must not hold the pointer");
+        assert_eq!(edges_of(&map), ["right"]);
+    }
+
+    #[test]
+    fn no_edges_means_no_barriers() {
+        let (barriers, map) = build_barriers(&SINGLE, Some(&[]));
+        assert!(barriers.is_empty(), "the whole border must stay reachable");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn barrier_ids_are_unique_and_nonzero_across_zones() {
+        let (_, map) = build_barriers(&DUAL, None);
+        assert_eq!(map.len(), 8, "four edges per zone");
+        let mut ids: Vec<u32> = map.iter().map(|(id, _)| *id).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "duplicate barrier ids would alias edges");
+        assert!(ids.iter().all(|id| *id != 0), "0 is not a valid barrier id");
+    }
+
+    #[test]
+    fn ids_are_stable_for_the_same_filter() {
+        let (_, a) = build_barriers(&DUAL, Some(&["left".to_string()]));
+        let (_, b) = build_barriers(&DUAL, Some(&["left".to_string()]));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn segments_are_built_verbatim_and_labelled() {
+        let segments = vec![
+            ("left".to_string(), 0, 300, 0, 800),
+            ("top".to_string(), 100, 0, 900, 0),
+        ];
+        let (barriers, map) = build_segment_barriers(&segments);
+        assert_eq!(barriers.len(), 2);
+        assert_eq!(edges_of(&map), ["left", "top"]);
+        assert!(map.iter().all(|(id, _)| *id != 0));
+    }
+
+    #[test]
+    fn segments_reject_non_axis_aligned_without_dropping_the_rest() {
+        // A diagonal would make the portal reject the whole SetPointerBarriers
+        // call, so it is skipped and its neighbours still get armed.
+        let segments = vec![
+            ("left".to_string(), 0, 0, 0, 500),
+            ("diagonal".to_string(), 0, 0, 500, 500),
+            ("right".to_string(), 1920, 0, 1920, 500),
+        ];
+        let (barriers, map) = build_segment_barriers(&segments);
+        assert_eq!(barriers.len(), 2);
+        assert_eq!(edges_of(&map), ["left", "right"]);
+    }
+
+    #[test]
+    fn a_single_point_segment_is_accepted() {
+        // Degenerate but axis-aligned: a one-pixel-tall placement. Valid, and
+        // dropping it would silently lose a real (if tiny) crossing.
+        let segments = vec![("left".to_string(), 0, 42, 0, 42)];
+        let (barriers, _) = build_segment_barriers(&segments);
+        assert_eq!(barriers.len(), 1);
+    }
+
+    #[test]
+    fn empty_segments_arm_nothing() {
+        let (barriers, map) = build_segment_barriers(&[]);
+        assert!(barriers.is_empty());
+        assert!(map.is_empty());
     }
 }
 
