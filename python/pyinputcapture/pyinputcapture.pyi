@@ -42,6 +42,15 @@ class InputCapturePortal:
         """Re-enable capture (barriers become active again)."""
         ...
 
+    def set_barriers(self, edges: list[str] | None = None) -> list[tuple[int, str]]:
+        """Replace the armed pointer barriers on the existing session.
+
+        Returns the new barrier_map, minus any barrier the compositor
+        rejected. Reuses the current session (re-running setup hangs the
+        GNOME portal).
+        """
+        ...
+
     def disable(self) -> None:
         """Disable capture (barriers deactivated)."""
         ...

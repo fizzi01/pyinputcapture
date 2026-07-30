@@ -37,6 +37,12 @@ class AsyncInputCapturePortal:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._portal.disable)
 
+    async def set_barriers(
+        self, edges: Optional[list[str]] = None
+    ) -> list[tuple[int, str]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._portal.set_barriers, edges)
+
     async def release(
         self,
         cursor_x: Optional[float] = None,

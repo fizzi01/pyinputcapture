@@ -24,6 +24,13 @@ use tokio::sync::{mpsc, oneshot};
 enum Cmd {
     Enable(oneshot::Sender<Result<(), String>>),
     Disable(oneshot::Sender<Result<(), String>>),
+    /// Re-issue SetPointerBarriers on the *existing* session, so the set of
+    /// armed edges can change without a CreateSession round trip (recreating
+    /// the session is what hangs the GNOME portal).
+    SetBarriers {
+        active_edges: Option<Vec<String>>,
+        reply: oneshot::Sender<Result<Vec<(u32, String)>, String>>,
+    },
     Release {
         cursor_position: Option<(f64, f64)>,
         reply: oneshot::Sender<Result<(), String>>,
@@ -136,6 +143,9 @@ async fn run_portal(
         .map(|r| (r.width(), r.height(), r.x_offset(), r.y_offset()))
         .collect();
 
+    // Kept for Cmd::SetBarriers, which rebuilds barriers for the same zones.
+    let zone_geometry = zones.clone();
+
     // Build edge barriers
     let (barriers, barrier_map) = build_barriers(&zones, active_edges.as_deref());
 
@@ -202,6 +212,36 @@ async fn run_portal(
                     }
                     Some(Cmd::Disable(reply)) => {
                         let r = ic.disable(&session).await.map_err(|e| e.to_string());
+                        reply.send(r).ok();
+                    }
+                    Some(Cmd::SetBarriers { active_edges, reply }) => {
+                        let (new_barriers, new_map) =
+                            build_barriers(&zone_geometry, active_edges.as_deref());
+                        let r = match ic
+                            .set_pointer_barriers(&session, &new_barriers, zone_set)
+                            .await
+                        {
+                            Err(e) => Err(format!("set_pointer_barriers request: {e}")),
+                            Ok(req) => match req.response() {
+                                Err(e) => Err(format!("set_pointer_barriers response: {e}")),
+                                Ok(resp) => {
+                                    let failed = resp.failed_barriers();
+                                    if !failed.is_empty() {
+                                        eprintln!(
+                                            "pyinputcapture: failed barrier ids: {failed:?}"
+                                        );
+                                    }
+                                    // Drop the ids the compositor rejected so the
+                                    // caller's map only holds live barriers.
+                                    Ok(new_map
+                                        .into_iter()
+                                        .filter(|(bid, _)| {
+                                            !failed.iter().any(|f| f.get() == *bid)
+                                        })
+                                        .collect())
+                                }
+                            },
+                        };
                         reply.send(r).ok();
                     }
                     Some(Cmd::Release { cursor_position, reply }) => {
@@ -340,6 +380,38 @@ impl InputCapturePortal {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("not set up"))?;
         send_simple_cmd(tx, Cmd::Enable)
+    }
+
+    /// Replace the armed pointer barriers on the existing session.
+    ///
+    /// `edges` is the same filter `setup` takes (`None` = all four edges of
+    /// every zone).  Returns the new `barrier_map`, with any barrier the
+    /// compositor rejected already removed.
+    ///
+    /// This exists so the caller can arm barriers *only* on edges that
+    /// actually lead somewhere: an armed barrier stops the pointer at the
+    /// screen edge, so arming all four means the cursor can never reach the
+    /// real border on edges with nothing behind them.  It reuses the current
+    /// session deliberately -- re-running `setup` is what hangs the GNOME
+    /// portal.
+    #[pyo3(signature = (edges=None))]
+    fn set_barriers(&self, edges: Option<Vec<String>>) -> PyResult<Vec<(u32, String)>> {
+        let tx = self
+            .cmd_tx
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("not set up"))?;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.blocking_send(Cmd::SetBarriers {
+            active_edges: edges,
+            reply: reply_tx,
+        })
+        .map_err(|_| PyRuntimeError::new_err("portal task not running"))?;
+
+        reply_rx
+            .blocking_recv()
+            .map_err(|_| PyRuntimeError::new_err("portal task dropped reply"))?
+            .map_err(PyRuntimeError::new_err)
     }
 
     /// Disable capture (barriers deactivated).
