@@ -16,8 +16,18 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.optional-dependencies]
+# pytest-timeout is not optional in practice: several tests exercise waits that
+# are only bounded by the portal being unreachable, and without it a regression
+# hangs the run instead of failing.
+dev = ["maturin>=1.0,<2.0", "pytest>=8", "pytest-timeout>=2"]
+
 [project.urls]
 Repository = "https://github.com/fizzi01/pyinputcapture"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["timeout: per-test wall-clock bound (pytest-timeout)"]
 
 [tool.maturin]
 features = ["extension-module"]

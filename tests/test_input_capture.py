@@ -33,6 +33,15 @@ class TestInstantiation:
         portal = InputCapturePortal()
         assert portal.activation_id == 0
 
+    def test_initial_barrier_map_empty(self):
+        portal = InputCapturePortal()
+        assert portal.barrier_map == []
+
+    def test_initial_zones_generation_zero(self):
+        # Bumped only when the compositor replaces the zones mid-session.
+        portal = InputCapturePortal()
+        assert portal.zones_generation == 0
+
     def test_multiple_instances(self):
         a = InputCapturePortal()
         b = InputCapturePortal()
@@ -78,20 +87,163 @@ class TestClose:
             portal.enable()
 
 
+class TestSetBarriers:
+    """``set_barriers`` re-arms barriers on a live session.
+
+    Without a compositor only the argument handling is reachable, which is
+    still the part a caller can get wrong. The barrier geometry itself is
+    covered by the Rust unit tests for ``build_segment_barriers``.
+    """
+
+    def test_exists(self):
+        portal = InputCapturePortal()
+        assert hasattr(portal, "set_barriers")
+
+    def test_raises_when_not_set_up(self):
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError, match="not set up"):
+            portal.set_barriers(["left"])
+
+    def test_no_args_raises_when_not_set_up(self):
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError, match="not set up"):
+            portal.set_barriers()
+
+    def test_empty_edges_raises_when_not_set_up(self):
+        # An empty list means "arm nothing", a legitimate request that must
+        # not be confused with None ("arm every edge").
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError, match="not set up"):
+            portal.set_barriers([])
+
+    def test_segments_keyword_raises_when_not_set_up(self):
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError, match="not set up"):
+            portal.set_barriers(segments=[("left", 0, 300, 0, 800)])
+
+    def test_segments_is_keyword_only(self):
+        portal = InputCapturePortal()
+        with pytest.raises(TypeError):
+            portal.set_barriers(["left"], [("left", 0, 0, 0, 100)])
+
+    def test_edges_and_segments_together_rejected(self):
+        # Conflicting arguments is a call error, so TypeError like the rest of
+        # Python. Checked before the "not set up" guard, so it surfaces here.
+        portal = InputCapturePortal()
+        with pytest.raises(TypeError, match="not both"):
+            portal.set_barriers(["left"], segments=[("left", 0, 0, 0, 100)])
+
+    def test_malformed_segment_is_rejected(self):
+        # PyO3 reports a wrong-length tuple as ValueError, not the TypeError a
+        # pure-Python signature would raise; pin what the binding actually does.
+        portal = InputCapturePortal()
+        with pytest.raises(ValueError, match="length 5"):
+            portal.set_barriers(segments=[("left", 0, 300)])
+
+    def test_diagonal_segment_is_rejected_by_index(self):
+        # Dropping it silently would leave the caller believing that span is
+        # armed; labels can repeat, so the returned map cannot say which one
+        # went missing. Checked before the "not set up" guard.
+        portal = InputCapturePortal()
+        with pytest.raises(ValueError, match="segment 1"):
+            portal.set_barriers(
+                segments=[
+                    ("left", 0, 0, 0, 500),
+                    ("diagonal", 0, 0, 500, 500),
+                ]
+            )
+
+    def test_after_close_raises_not_set_up(self):
+        portal = InputCapturePortal()
+        portal.close()
+        with pytest.raises(RuntimeError, match="not set up"):
+            portal.set_barriers(["left"])
+
+
 class TestSetupNoBus:
+    @pytest.fixture(autouse=True)
+    def _no_session_bus(self, monkeypatch):
+        # Every test in here calls setup(). Without this the calls would reach a
+        # real portal on a desktop session and pop a permission dialog mid-suite.
+        #
+        # Unsetting DBUS_SESSION_BUS_ADDRESS is not enough: zbus then falls back
+        # to $XDG_RUNTIME_DIR/bus, which exists on a CI runner, and setup() parks
+        # on a D-Bus reply that never comes. Point the address at a socket that
+        # cannot exist so the connection fails immediately on every machine.
+        monkeypatch.setenv(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/nonexistent/pyinputcapture-test-bus",
+        )
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+
     @pytest.mark.skipif(
         sys.platform != "linux",
         reason="InputCapture portal only works on Linux",
     )
-    def test_setup_without_dbus_raises(self, monkeypatch):
-        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    def test_setup_without_dbus_raises(self):
         portal = InputCapturePortal()
         with pytest.raises(RuntimeError):
             portal.setup()
 
-    def test_double_setup_raises(self):
-        # Can't complete setup without a compositor; documents intent.
-        pass
+    @pytest.mark.skipif(
+        sys.platform != "linux",
+        reason="InputCapture portal only works on Linux",
+    )
+    def test_setup_failure_names_the_failing_step(self):
+        """The reason must survive the hop back to Python.
+
+        Every setup step exits via `?`, which used to drop the result sender
+        unsent — leaving only the generic "portal setup channel closed" while the
+        real cause went to stderr and was usually discarded.
+        """
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError) as excinfo:
+            portal.setup()
+        assert "channel closed" not in str(excinfo.value)
+
+    def test_setup_accepts_a_positional_timeout(self):
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError):
+            portal.setup(None, 0.25)
+
+    def test_setup_accepts_timeout_by_keyword(self):
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError):
+            portal.setup(edges=["left"], timeout=0.25)
+
+    @pytest.mark.timeout(30)
+    def test_setup_accepts_none_timeout(self):
+        # None means "wait indefinitely", so this test is only bounded by the
+        # bus being unreachable. The explicit mark makes a regression here fail
+        # as itself instead of hanging the whole suite, which is how it first
+        # showed up in CI.
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError):
+            portal.setup(["left"], None)
+
+    def test_setup_rejects_a_zero_timeout(self):
+        # Zero reads as "fail fast", never as "wait forever".
+        portal = InputCapturePortal()
+        with pytest.raises(ValueError, match="greater than 0"):
+            portal.setup(None, 0.0)
+
+    def test_setup_rejects_a_negative_timeout(self):
+        portal = InputCapturePortal()
+        with pytest.raises(ValueError):
+            portal.setup(None, -1.0)
+
+    def test_setup_rejects_nan_timeout(self):
+        portal = InputCapturePortal()
+        with pytest.raises(ValueError, match="NaN"):
+            portal.setup(None, float("nan"))
+
+    @pytest.mark.timeout(30)
+    def test_setup_accepts_infinite_timeout(self):
+        # inf is a legitimate spelling of "wait forever"; it used to panic
+        # inside Duration::from_secs_f64.
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError):
+            portal.setup(None, float("inf"))
 
 
 class TestReleaseSignature:

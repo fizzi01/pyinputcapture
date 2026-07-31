@@ -25,6 +25,7 @@ jobs:
       !startsWith(github.event.head_commit.message, 'docs') &&
       !startsWith(github.event.head_commit.message, 'ci')
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -39,13 +40,15 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest
+          pip install maturin pytest pytest-timeout
           maturin develop
 
       - name: Python tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/ -v
+          # thread method: a hang inside the Rust extension runs with the GIL
+          # released, so the signal-based timeout would never fire.
+          python -m pytest tests/ -v --timeout=60 --timeout-method=thread
 
   build:
     needs: test

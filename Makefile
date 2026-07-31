@@ -20,8 +20,10 @@ test-rust:
 	cargo test
 
 # Python tests (requires `maturin develop` first)
+# The thread method is the one that works here: a hang inside the extension
+# holds no GIL, so a signal-based timeout would never fire.
 test-python:
-	python -m pytest tests/ -v
+	python -m pytest tests/ -v --timeout=60 --timeout-method=thread
 
 clean:
 	cargo clean

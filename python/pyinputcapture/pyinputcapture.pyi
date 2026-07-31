@@ -7,7 +7,21 @@ class InputCapturePortal:
 
     @property
     def zones(self) -> list[tuple[int, int, int, int]]:
-        """Screen zones as [(width, height, x_offset, y_offset), ...]."""
+        """Screen zones as [(width, height, x_offset, y_offset), ...].
+
+        Re-read after `zones_generation` changes: the compositor can replace
+        them mid-session.
+        """
+        ...
+
+    @property
+    def barrier_map(self) -> list[tuple[int, str]]:
+        """Currently armed barriers as [(barrier_id, label), ...]."""
+        ...
+
+    @property
+    def zones_generation(self) -> int:
+        """Bumped whenever the zones changed and the barriers were re-armed."""
         ...
 
     @property
@@ -26,20 +40,43 @@ class InputCapturePortal:
         ...
 
     def setup(
-        self, edges: list[str] | None = None
+        self,
+        edges: list[str] | None = None,
+        timeout: float | None = 120.0,
     ) -> tuple[list[tuple[int, int, int, int]], int, list[tuple[int, str]]]:
         """Create session, set barriers, connect to EIS.
 
         Returns (zones, eis_fd, barrier_map).
-        """
-        ...
 
-    def poll_activated(self) -> tuple[int, float, float] | None:
-        """Pop the next Activated event from the queue, or None."""
+        Blocks until the portal answers — on GNOME, until the user answers the
+        permission dialog — but releases the GIL while waiting, so Ctrl-C still
+        works. `timeout` (seconds) bounds that wait; pass None to wait
+        indefinitely. Zero or negative raises ValueError.
+        """
         ...
 
     def enable(self) -> None:
         """Re-enable capture (barriers become active again)."""
+        ...
+
+    def set_barriers(
+        self,
+        edges: list[str] | None = None,
+        *,
+        segments: list[tuple[str, int, int, int, int]] | None = None,
+    ) -> list[tuple[int, str]]:
+        """Replace the armed pointer barriers on the existing session.
+
+        Pass either `edges` (whole zone edges by name, None = all of them) or
+        `segments` ((label, x1, y1, x2, y2) axis-aligned lines in absolute
+        desktop coordinates, for an edge only partly abutted) — not both,
+        which raises TypeError. A non-axis-aligned segment raises ValueError
+        naming its index.
+
+        Returns the new barrier_map, minus any barrier the compositor
+        rejected. Reuses the current session (re-running setup hangs the
+        GNOME portal).
+        """
         ...
 
     def disable(self) -> None:
