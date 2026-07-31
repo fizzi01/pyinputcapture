@@ -140,7 +140,16 @@ class TestSetupNoBus:
     def _no_session_bus(self, monkeypatch):
         # Every test in here calls setup(). Without this the calls would reach a
         # real portal on a desktop session and pop a permission dialog mid-suite.
-        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        #
+        # Unsetting DBUS_SESSION_BUS_ADDRESS is not enough: zbus then falls back
+        # to $XDG_RUNTIME_DIR/bus, which exists on a CI runner, and setup() parks
+        # on a D-Bus reply that never comes. Point the address at a socket that
+        # cannot exist so the connection fails immediately on every machine.
+        monkeypatch.setenv(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/nonexistent/pyinputcapture-test-bus",
+        )
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
 
     @pytest.mark.skipif(
         sys.platform != "linux",
