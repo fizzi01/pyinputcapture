@@ -11,16 +11,25 @@
 //! see the corresponding barrier_id and cursor position.
 
 use std::num::NonZeroU32;
-use std::os::fd::IntoRawFd;
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use ashpd::desktop::input_capture::{ActivatedBarrier, Barrier, Capabilities, InputCapture};
+use ashpd::desktop::Session;
 use futures_util::StreamExt;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use tokio::sync::{mpsc, oneshot};
+
+/// A poisoned lock only means some other thread panicked while holding it; the
+/// data behind it is a plain snapshot of portal geometry, so there is nothing
+/// to salvage or invalidate. Taking the inner value keeps a panic in one Python
+/// thread from turning every later call into an error.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 enum Cmd {
     Enable(oneshot::Sender<Result<(), String>>),
@@ -58,6 +67,20 @@ struct SetupResult {
     barrier_map: Vec<(u32, String)>,
 }
 
+/// Portal geometry as of the last time the portal told us about it.
+///
+/// Not a set-once snapshot: the compositor invalidates the `zone_set` whenever
+/// the zones change (monitor hotplug, resolution change), and every later
+/// SetPointerBarriers carrying the stale id is refused. The portal task
+/// refreshes this on `ZonesChanged`, so it lives behind a mutex that Python
+/// readers share.
+#[derive(Default)]
+struct SessionState {
+    zones: Vec<(u32, u32, i32, i32)>,
+    barrier_map: Vec<(u32, String)>,
+    zone_set: u32,
+}
+
 /// Shared activation data between the tokio task and Python readers.
 /// Laid out so that `activation_id` (the sequencing field) and
 /// `barrier_id` share the same cache line.
@@ -67,6 +90,10 @@ struct SharedActivation {
     barrier_id: AtomicU32,
     cursor_pos_x: AtomicU64,
     cursor_pos_y: AtomicU64,
+    /// Bumped every time the portal reported new zones and the barriers were
+    /// re-armed. A caller that cached `zones`/`barrier_map` watches this to
+    /// know the cached copy is stale.
+    zones_generation: AtomicU32,
 }
 
 impl SharedActivation {
@@ -76,12 +103,14 @@ impl SharedActivation {
             barrier_id: AtomicU32::new(0),
             cursor_pos_x: AtomicU64::new(0),
             cursor_pos_y: AtomicU64::new(0),
+            zones_generation: AtomicU32::new(0),
         }
     }
 
     fn reset(&self) {
         self.activation_id.store(0, Ordering::Relaxed);
         self.barrier_id.store(0, Ordering::Relaxed);
+        self.zones_generation.store(0, Ordering::Relaxed);
     }
 }
 
@@ -121,30 +150,44 @@ fn build_barriers(
     (barriers, barrier_map)
 }
 
+/// Reject segments the portal cannot express, naming the offender.
+///
+/// The spec only accepts axis-aligned barriers, and one diagonal makes the
+/// compositor refuse the whole SetPointerBarriers call. Skipping it silently
+/// was worse: labels may legitimately repeat (two clients against the same
+/// edge), so the returned barrier map does not say which input went missing
+/// and the caller ends up with an unguarded span it believes is armed. The
+/// index is what pins the offender down.
+fn validate_segments(segments: &[(String, i32, i32, i32, i32)]) -> Result<(), String> {
+    for (i, (label, x1, y1, x2, y2)) in segments.iter().enumerate() {
+        if x1 != x2 && y1 != y2 {
+            return Err(format!(
+                "segment {i} ({label:?}) is not axis-aligned: \
+                 ({x1}, {y1}) -> ({x2}, {y2}); barriers must be horizontal or vertical"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Build barriers from explicit line segments in absolute desktop coordinates.
 ///
 /// Each entry is `(label, x1, y1, x2, y2)`; the label is what comes back in the
 /// barrier map, so the caller can tell which edge an activation belongs to.
-/// Degenerate entries (neither horizontal nor vertical) are skipped: the portal
-/// spec only accepts axis-aligned barriers, and a diagonal would be rejected
-/// wholesale, taking the valid barriers of the same call down with it.
+/// Entries are taken verbatim — `validate_segments` has already rejected the
+/// ones the portal would refuse.
 fn build_segment_barriers(
     segments: &[(String, i32, i32, i32, i32)],
 ) -> (Vec<Barrier>, Vec<(u32, String)>) {
     let mut barriers = Vec::with_capacity(segments.len());
     let mut barrier_map = Vec::with_capacity(segments.len());
-    let mut bid: u32 = 1;
 
-    for (label, x1, y1, x2, y2) in segments {
-        if x1 != x2 && y1 != y2 {
-            eprintln!("pyinputcapture: skipping non-axis-aligned barrier {label:?}");
-            continue;
-        }
+    for (i, (label, x1, y1, x2, y2)) in segments.iter().enumerate() {
+        let bid = (i as u32) + 1;
         if let Some(barrier_id) = NonZeroU32::new(bid) {
             barriers.push(Barrier::new(barrier_id, (*x1, *y1, *x2, *y2)));
             barrier_map.push((bid, label.clone()));
         }
-        bid += 1;
     }
 
     (barriers, barrier_map)
@@ -159,14 +202,27 @@ fn build_segment_barriers(
 /// sender is threaded through as an `Option` that `portal_session` takes when it
 /// succeeds, so exactly one of the two paths answers: `Ok` from inside, `Err`
 /// from here.
+/// Close an fd that was already flattened to a bare int for the trip to Python
+/// but never made it there.
+///
+/// # Safety-relevant invariant
+/// Only call this with an fd that was produced by `into_raw_fd` on this side
+/// and was never handed out: taking ownership back is only sound while nothing
+/// else can close it.
+fn close_orphan_fd(raw_fd: i32) {
+    // SAFETY: per the invariant above, this is the sole remaining owner.
+    drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+}
+
 async fn run_portal(
     setup_tx: oneshot::Sender<Result<SetupResult, String>>,
     cmd_rx: mpsc::Receiver<Cmd>,
     shared: &SharedActivation,
+    state: &Mutex<SessionState>,
     active_edges: Option<Vec<String>>,
 ) -> Result<(), String> {
     let mut setup_tx = Some(setup_tx);
-    let result = portal_session(&mut setup_tx, cmd_rx, shared, active_edges).await;
+    let result = portal_session(&mut setup_tx, cmd_rx, shared, state, active_edges).await;
     if let Err(e) = &result {
         // Still Some ⇒ we failed before handing the session over.
         if let Some(tx) = setup_tx.take() {
@@ -176,10 +232,80 @@ async fn run_portal(
     result
 }
 
+/// Arm `spec` against the zones currently recorded in `state`, and record the
+/// resulting map there.
+///
+/// Barriers the compositor rejected are dropped from the map, so what Python
+/// holds only ever names barriers that exist.
+async fn arm_barriers(
+    ic: &InputCapture<'_>,
+    session: &Session<'_, InputCapture<'_>>,
+    spec: &BarrierSpec,
+    state: &Mutex<SessionState>,
+) -> Result<Vec<(u32, String)>, String> {
+    let (zone_geometry, zone_set) = {
+        let st = lock(state);
+        (st.zones.clone(), st.zone_set)
+    };
+
+    let (barriers, map) = match spec {
+        BarrierSpec::Edges(edges) => build_barriers(&zone_geometry, edges.as_deref()),
+        BarrierSpec::Segments(segments) => build_segment_barriers(segments),
+    };
+
+    let resp = ic
+        .set_pointer_barriers(session, &barriers, zone_set)
+        .await
+        .map_err(|e| format!("set_pointer_barriers request: {e}"))?
+        .response()
+        .map_err(|e| format!("set_pointer_barriers response: {e}"))?;
+
+    let failed = resp.failed_barriers();
+    if !failed.is_empty() {
+        eprintln!("pyinputcapture: failed barrier ids: {failed:?}");
+    }
+
+    let map: Vec<(u32, String)> = map
+        .into_iter()
+        .filter(|(bid, _)| !failed.iter().any(|f| f.get() == *bid))
+        .collect();
+
+    lock(state).barrier_map = map.clone();
+    Ok(map)
+}
+
+/// Re-read the zones and re-arm, after the compositor invalidated the zone_set.
+async fn refresh_zones(
+    ic: &InputCapture<'_>,
+    session: &Session<'_, InputCapture<'_>>,
+    spec: &BarrierSpec,
+    state: &Mutex<SessionState>,
+) -> Result<(), String> {
+    let zones_resp = ic
+        .zones(session)
+        .await
+        .map_err(|e| format!("zones request: {e}"))?
+        .response()
+        .map_err(|e| format!("zones response: {e}"))?;
+
+    {
+        let mut st = lock(state);
+        st.zones = zones_resp
+            .regions()
+            .iter()
+            .map(|r| (r.width(), r.height(), r.x_offset(), r.y_offset()))
+            .collect();
+        st.zone_set = zones_resp.zone_set();
+    }
+
+    arm_barriers(ic, session, spec, state).await.map(|_| ())
+}
+
 async fn portal_session(
     setup_tx: &mut Option<oneshot::Sender<Result<SetupResult, String>>>,
-    mut cmd_rx: mpsc::Receiver<Cmd>,
+    cmd_rx: mpsc::Receiver<Cmd>,
     shared: &SharedActivation,
+    state: &Mutex<SessionState>,
     active_edges: Option<Vec<String>>,
 ) -> Result<(), String> {
     // Create portal proxy
@@ -198,63 +324,91 @@ async fn portal_session(
         .await
         .map_err(|e| format!("create_session: {e}"))?;
 
+    let result = live_session(&ic, &session, setup_tx, cmd_rx, shared, state, active_edges).await;
+
+    // Hand the session back however we got here. Dropping the proxy alone
+    // leaves it alive on the compositor side, and one of the ways here is a
+    // `setup()` that gave up on its timeout while the permission dialog was
+    // still on screen - the session it left behind would never be closed.
+    session.close().await.ok();
+
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn live_session(
+    ic: &InputCapture<'_>,
+    session: &Session<'_, InputCapture<'_>>,
+    setup_tx: &mut Option<oneshot::Sender<Result<SetupResult, String>>>,
+    mut cmd_rx: mpsc::Receiver<Cmd>,
+    shared: &SharedActivation,
+    state: &Mutex<SessionState>,
+    active_edges: Option<Vec<String>>,
+) -> Result<(), String> {
     // Get zones
     let zones_resp = ic
-        .zones(&session)
+        .zones(session)
         .await
         .map_err(|e| format!("zones request: {e}"))?
         .response()
         .map_err(|e| format!("zones response: {e}"))?;
 
-    let regions = zones_resp.regions();
-    let zone_set = zones_resp.zone_set();
-
-    let zones: Vec<(u32, u32, i32, i32)> = regions
-        .iter()
-        .map(|r| (r.width(), r.height(), r.x_offset(), r.y_offset()))
-        .collect();
-
-    // Kept for Cmd::SetBarriers, which rebuilds barriers for the same zones.
-    let zone_geometry = zones.clone();
-
-    // Build edge barriers
-    let (barriers, barrier_map) = build_barriers(&zones, active_edges.as_deref());
-
-    let barrier_resp = ic
-        .set_pointer_barriers(&session, &barriers, zone_set)
-        .await
-        .map_err(|e| format!("set_pointer_barriers request: {e}"))?
-        .response()
-        .map_err(|e| format!("set_pointer_barriers response: {e}"))?;
-
-    let failed = barrier_resp.failed_barriers();
-    if !failed.is_empty() {
-        eprintln!("pyinputcapture: failed barrier ids: {failed:?}");
+    {
+        let mut st = lock(state);
+        st.zones = zones_resp
+            .regions()
+            .iter()
+            .map(|r| (r.width(), r.height(), r.x_offset(), r.y_offset()))
+            .collect();
+        st.zone_set = zones_resp.zone_set();
     }
 
+    // The spec stays around: ZonesChanged and Cmd::SetBarriers both re-arm, and
+    // a refresh must reproduce what the caller last asked for, not the default.
+    let mut spec = BarrierSpec::Edges(active_edges);
+
+    let barrier_map = arm_barriers(ic, session, &spec, state).await?;
+
     // Connect to EIS
-    let eis_fd = ic
-        .connect_to_eis(&session)
+    let eis_fd: OwnedFd = ic
+        .connect_to_eis(session)
         .await
         .map_err(|e| format!("connect_to_eis: {e}"))?;
-    let eis_raw_fd = eis_fd.into_raw_fd();
 
     // Send setup results back to Python
-    setup_tx
+    let zones = lock(state).zones.clone();
+    let tx = setup_tx
         .take()
-        .ok_or_else(|| "setup already reported".to_string())?
-        .send(Ok(SetupResult {
-            zones,
-            eis_raw_fd,
-            barrier_map,
-        }))
-        .map_err(|_| "setup result channel closed".to_string())?;
+        .ok_or_else(|| "setup already reported".to_string())?;
+
+    if let Err(unsent) = tx.send(Ok(SetupResult {
+        zones,
+        eis_raw_fd: eis_fd.into_raw_fd(),
+        barrier_map,
+    })) {
+        // Nobody is listening: `setup()` timed out and returned. The fd left
+        // ownership as a bare int the moment it went into the message, so this
+        // is the last place that can close it - otherwise every timed-out
+        // setup leaks one.
+        if let Ok(result) = unsent {
+            close_orphan_fd(result.eis_raw_fd);
+        }
+        return Err("setup result channel closed".to_string());
+    }
 
     // Subscribe to Activated signal
     let mut activated_stream = ic
         .receive_activated()
         .await
         .map_err(|e| format!("receive_activated: {e}"))?;
+
+    // ZonesChanged invalidates the zone_set we hold: from then on every
+    // SetPointerBarriers with it is refused and the remembered geometry
+    // describes a screen that no longer exists.
+    let mut zones_changed_stream = ic
+        .receive_zones_changed()
+        .await
+        .map_err(|e| format!("receive_zones_changed: {e}"))?;
 
     // Event + command loop
     loop {
@@ -277,63 +431,48 @@ async fn portal_session(
                     shared.activation_id.store(aid, Ordering::Release);
                 }
             }
+            Some(_) = zones_changed_stream.next() => {
+                match refresh_zones(ic, session, &spec, state).await {
+                    // Only now is the new geometry consistent with the armed
+                    // barriers, so this is the point a reader can trust.
+                    Ok(()) => {
+                        shared.zones_generation.fetch_add(1, Ordering::Release);
+                    }
+                    Err(e) => {
+                        eprintln!("pyinputcapture: zones changed but re-arming failed: {e}");
+                    }
+                }
+            }
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(Cmd::Enable(reply)) => {
-                        let r = ic.enable(&session).await.map_err(|e| e.to_string());
+                        let r = ic.enable(session).await.map_err(|e| e.to_string());
                         reply.send(r).ok();
                     }
                     Some(Cmd::Disable(reply)) => {
-                        let r = ic.disable(&session).await.map_err(|e| e.to_string());
+                        let r = ic.disable(session).await.map_err(|e| e.to_string());
                         reply.send(r).ok();
                     }
-                    Some(Cmd::SetBarriers { spec, reply }) => {
-                        let (new_barriers, new_map) = match &spec {
-                            BarrierSpec::Edges(edges) => {
-                                build_barriers(&zone_geometry, edges.as_deref())
-                            }
-                            BarrierSpec::Segments(segments) => {
-                                build_segment_barriers(segments)
-                            }
-                        };
-                        let r = match ic
-                            .set_pointer_barriers(&session, &new_barriers, zone_set)
-                            .await
-                        {
-                            Err(e) => Err(format!("set_pointer_barriers request: {e}")),
-                            Ok(req) => match req.response() {
-                                Err(e) => Err(format!("set_pointer_barriers response: {e}")),
-                                Ok(resp) => {
-                                    let failed = resp.failed_barriers();
-                                    if !failed.is_empty() {
-                                        eprintln!(
-                                            "pyinputcapture: failed barrier ids: {failed:?}"
-                                        );
-                                    }
-                                    // Drop the ids the compositor rejected so the
-                                    // caller's map only holds live barriers.
-                                    Ok(new_map
-                                        .into_iter()
-                                        .filter(|(bid, _)| {
-                                            !failed.iter().any(|f| f.get() == *bid)
-                                        })
-                                        .collect())
-                                }
-                            },
-                        };
+                    Some(Cmd::SetBarriers { spec: new_spec, reply }) => {
+                        let r = arm_barriers(ic, session, &new_spec, state).await;
+                        // Remember it only if it took: a failed re-arm must not
+                        // become what a later ZonesChanged reproduces.
+                        if r.is_ok() {
+                            spec = new_spec;
+                        }
                         reply.send(r).ok();
                     }
                     Some(Cmd::Release { cursor_position, reply }) => {
                         let aid_val = shared.activation_id.load(Ordering::Acquire);
                         let aid_opt = if aid_val > 0 { Some(aid_val) } else { None };
                         let r = ic
-                            .release(&session, aid_opt, cursor_position)
+                            .release(session, aid_opt, cursor_position)
                             .await
                             .map_err(|e| e.to_string());
                         reply.send(r).ok();
                     }
                     Some(Cmd::Close) | None => {
-                        ic.disable(&session).await.ok();
+                        ic.disable(session).await.ok();
                         break;
                     }
                 }
@@ -367,6 +506,76 @@ fn send_simple_cmd(
     })
 }
 
+/// Longest bounded wait we will honour. Past this a `timeout` is indistinguish-
+/// able from "forever", and `Duration::from_secs_f64` starts to panic on the
+/// values a caller reaches for when they mean forever.
+const MAX_TIMEOUT_SECS: f64 = 60.0;
+
+/// Turn the Python-facing `timeout` into a deadline.
+///
+/// `None` (and `inf`, which spells the same intent) means wait indefinitely.
+/// Zero and negatives are rejected rather than silently read as "forever" -
+/// `setup(timeout=0)` is a caller asking to fail fast, and answering that with
+/// an unbounded wait is the worst possible reading.
+fn deadline_from(timeout: Option<f64>) -> PyResult<Option<Duration>> {
+    match timeout {
+        None => Ok(None),
+        Some(secs) if secs.is_nan() => Err(PyValueError::new_err(
+            "timeout must be a number of seconds or None, not NaN",
+        )),
+        Some(secs) if secs <= 0.0 => Err(PyValueError::new_err(format!(
+            "timeout must be greater than 0 seconds (got {secs}); \
+             pass None to wait indefinitely"
+        ))),
+        Some(secs) if secs.is_infinite() => Ok(None),
+        Some(secs) => Ok(Some(Duration::from_secs_f64(secs.min(MAX_TIMEOUT_SECS)))),
+    }
+}
+
+/// Wait for the portal task's answer without pinning the interpreter.
+///
+/// The wait runs in short slices with the GIL released; between slices the GIL
+/// comes back just long enough to run Python's signal handlers. Without that,
+/// a wait with no deadline is un-interruptible: the handler for Ctrl-C only
+/// runs when the thread executes bytecode, so the process has to be killed.
+fn wait_for_setup(
+    py: Python<'_>,
+    handle: &tokio::runtime::Handle,
+    mut setup_rx: oneshot::Receiver<Result<SetupResult, String>>,
+    deadline: Option<Duration>,
+) -> PyResult<SetupResult> {
+    const SLICE: Duration = Duration::from_millis(100);
+    let started = Instant::now();
+
+    loop {
+        let slice = match deadline {
+            Some(limit) => {
+                let left = limit.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "portal setup timed out after {}s (permission dialog unanswered?)",
+                        limit.as_secs_f64()
+                    )));
+                }
+                left.min(SLICE)
+            }
+            None => SLICE,
+        };
+
+        let outcome = py.allow_threads(|| {
+            handle.block_on(async { tokio::time::timeout(slice, &mut setup_rx).await })
+        });
+
+        match outcome {
+            Ok(Ok(result)) => return result.map_err(PyRuntimeError::new_err),
+            Ok(Err(_)) => return Err(PyRuntimeError::new_err("portal setup channel closed")),
+            // Slice expired with no answer: let Python raise a pending
+            // KeyboardInterrupt, then keep waiting.
+            Err(_) => py.check_signals()?,
+        }
+    }
+}
+
 /// Wayland InputCapture portal (ashpd).  All methods are blocking, but they
 /// release the GIL while they wait (see `send_simple_cmd`), so a Python program
 /// stays responsive even while a permission dialog is on screen.
@@ -377,9 +586,30 @@ fn send_simple_cmd(
 #[pyclass]
 struct InputCapturePortal {
     rt: tokio::runtime::Runtime,
-    cmd_tx: Option<mpsc::Sender<Cmd>>,
+    /// Behind a mutex so every method can take `&self`. With `&mut self` on
+    /// `close`, PyO3's runtime borrow check refused the call whenever another
+    /// thread sat inside `release`/`enable` with the GIL released - i.e.
+    /// exactly when a second thread needs to break the deadlock.
+    cmd_tx: Mutex<Option<mpsc::Sender<Cmd>>>,
+    /// The task of a `setup()` that timed out may still be finishing (a late
+    /// answer to the permission dialog). Starting a second one meanwhile would
+    /// leave two portal sessions alive, only one of them reachable.
+    pending: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shared: Arc<SharedActivation>,
-    zones: Vec<(u32, u32, i32, i32)>,
+    state: Arc<Mutex<SessionState>>,
+}
+
+impl InputCapturePortal {
+    /// A clone of the command sender, or the "not set up" error.
+    ///
+    /// Cloned out rather than borrowed: the caller then blocks on the portal
+    /// for an unbounded time, and holding the lock across that would block
+    /// `close()` - the one call that can end the wait.
+    fn sender(&self) -> PyResult<mpsc::Sender<Cmd>> {
+        lock(&self.cmd_tx)
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("not set up"))
+    }
 }
 
 #[pymethods]
@@ -395,9 +625,10 @@ impl InputCapturePortal {
 
         Ok(Self {
             rt,
-            cmd_tx: None,
+            cmd_tx: Mutex::new(None),
+            pending: Mutex::new(None),
             shared: Arc::new(SharedActivation::new()),
-            zones: Vec::new(),
+            state: Arc::new(Mutex::new(SessionState::default())),
         })
     }
 
@@ -406,62 +637,96 @@ impl InputCapturePortal {
     ///
     /// Blocks until the portal answers — which on GNOME means until the user
     /// answers the permission dialog — but **releases the GIL while it waits**, so
-    /// the calling program keeps running. `timeout` (seconds, default 120) bounds
-    /// that wait so an ignored dialog fails cleanly instead of pinning the thread
-    /// forever; pass `None` to wait indefinitely.
+    /// the calling program keeps running and Ctrl-C still lands. `timeout`
+    /// (seconds, default 120) bounds that wait so an ignored dialog fails cleanly
+    /// instead of pinning the thread forever; `None` waits indefinitely. Zero or
+    /// negative values are an error, not a synonym for "forever".
     #[pyo3(signature = (edges=None, timeout=120.0))]
     fn setup(
-        &mut self,
+        &self,
         py: Python<'_>,
         edges: Option<Vec<String>>,
         timeout: Option<f64>,
     ) -> PyResult<(Vec<(u32, u32, i32, i32)>, i32, Vec<(u32, String)>)> {
-        if self.cmd_tx.is_some() {
+        let deadline = deadline_from(timeout)?;
+
+        if lock(&self.cmd_tx).is_some() {
             return Err(PyRuntimeError::new_err("already set up"));
+        }
+        {
+            // A task from an earlier attempt that timed out may still be
+            // creating a session; a second one now would leave the first alive
+            // and unreachable.
+            let mut pending = lock(&self.pending);
+            match pending.as_ref() {
+                Some(handle) if !handle.is_finished() => {
+                    return Err(PyRuntimeError::new_err(
+                        "a previous setup is still winding down (the portal has not \
+                         answered it yet); retry once it has",
+                    ));
+                }
+                _ => *pending = None,
+            }
         }
 
         let (setup_tx, setup_rx) = oneshot::channel();
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let shared = self.shared.clone();
+        let state = self.state.clone();
 
         // Reset atomics for the new session
         self.shared.reset();
+        *lock(&self.state) = SessionState::default();
 
-        self.rt.spawn(async move {
-            if let Err(e) = run_portal(setup_tx, cmd_rx, &shared, edges).await {
+        let task = self.rt.spawn(async move {
+            if let Err(e) = run_portal(setup_tx, cmd_rx, &shared, &state, edges).await {
                 eprintln!("pyinputcapture: portal task error: {e}");
             }
         });
 
         let handle = self.rt.handle().clone();
-        let result = py.allow_threads(|| -> PyResult<SetupResult> {
-            match timeout {
-                Some(secs) if secs > 0.0 => handle
-                    .block_on(async {
-                        tokio::time::timeout(Duration::from_secs_f64(secs), setup_rx).await
-                    })
-                    .map_err(|_| {
-                        PyRuntimeError::new_err(format!(
-                            "portal setup timed out after {secs}s \
-                             (permission dialog unanswered?)"
-                        ))
-                    })?,
-                _ => setup_rx.blocking_recv(),
+        let result = match wait_for_setup(py, &handle, setup_rx, deadline) {
+            Ok(result) => result,
+            Err(e) => {
+                // Dropping `cmd_tx` here closes the command channel, which the
+                // task reads as a Close; `portal_session` then closes whatever
+                // session it managed to create. Track the task so the next
+                // `setup()` does not race it.
+                drop(cmd_tx);
+                *lock(&self.pending) = Some(task);
+                return Err(e);
             }
-            .map_err(|_| PyRuntimeError::new_err("portal setup channel closed"))?
-            .map_err(PyRuntimeError::new_err)
-        })?;
+        };
 
-        self.cmd_tx = Some(cmd_tx);
-        self.zones = result.zones.clone();
+        *lock(&self.cmd_tx) = Some(cmd_tx);
+        *lock(&self.pending) = None;
 
         Ok((result.zones, result.eis_raw_fd, result.barrier_map))
     }
 
     /// Screen zones as `[(width, height, x_offset, y_offset), ...]`.
+    ///
+    /// Re-read after `zones_generation` changes: the compositor can replace
+    /// them mid-session.
     #[getter]
     fn zones(&self) -> Vec<(u32, u32, i32, i32)> {
-        self.zones.clone()
+        lock(&self.state).zones.clone()
+    }
+
+    /// The barriers currently armed, as `[(barrier_id, label), ...]`.
+    ///
+    /// Same list `setup`/`set_barriers` returned, kept up to date when the
+    /// portal task re-arms after a zone change.
+    #[getter]
+    fn barrier_map(&self) -> Vec<(u32, String)> {
+        lock(&self.state).barrier_map.clone()
+    }
+
+    /// Counter bumped every time the zones changed and the barriers were
+    /// re-armed. Watch it to know a cached `zones`/`barrier_map` is stale.
+    #[getter]
+    fn zones_generation(&self) -> u32 {
+        self.shared.zones_generation.load(Ordering::Acquire)
     }
 
     /// Latest activation ID received from the compositor.
@@ -488,11 +753,7 @@ impl InputCapturePortal {
 
     /// Re-enable capture (barriers become active again).
     fn enable(&self, py: Python<'_>) -> PyResult<()> {
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("not set up"))?;
-        send_simple_cmd(py, tx, Cmd::Enable)
+        send_simple_cmd(py, &self.sender()?, Cmd::Enable)
     }
 
     /// Replace the armed pointer barriers on the existing session.
@@ -503,7 +764,9 @@ impl InputCapturePortal {
     ///   edges of every zone).
     /// * `segments` -- explicit `(label, x1, y1, x2, y2)` lines in absolute
     ///   desktop coordinates, for when a client abuts only *part* of an edge.
-    ///   Must be axis-aligned; the label is echoed back in the barrier map.
+    ///   Must be axis-aligned - a diagonal is rejected by index rather than
+    ///   dropped, since labels may repeat and the returned map would not say
+    ///   which span was left unguarded.
     ///
     /// Returns the new `barrier_map`, with any barrier the compositor rejected
     /// already removed.
@@ -521,15 +784,17 @@ impl InputCapturePortal {
         segments: Option<Vec<(String, i32, i32, i32, i32)>>,
     ) -> PyResult<Vec<(u32, String)>> {
         if edges.is_some() && segments.is_some() {
-            return Err(PyRuntimeError::new_err(
+            // A caller mistake in how the function was called, so TypeError -
+            // the same thing Python raises for conflicting arguments.
+            return Err(PyTypeError::new_err(
                 "pass either edges or segments, not both",
             ));
         }
+        if let Some(s) = segments.as_deref() {
+            validate_segments(s).map_err(PyValueError::new_err)?;
+        }
 
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("not set up"))?;
+        let tx = self.sender()?;
 
         let spec = match segments {
             Some(s) => BarrierSpec::Segments(s),
@@ -553,11 +818,7 @@ impl InputCapturePortal {
 
     /// Disable capture (barriers deactivated).
     fn disable(&self, py: Python<'_>) -> PyResult<()> {
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("not set up"))?;
-        send_simple_cmd(py, tx, Cmd::Disable)
+        send_simple_cmd(py, &self.sender()?, Cmd::Disable)
     }
 
     /// Release captured input.  Optional `cursor_x`/`cursor_y` reposition
@@ -569,10 +830,7 @@ impl InputCapturePortal {
         cursor_x: Option<f64>,
         cursor_y: Option<f64>,
     ) -> PyResult<()> {
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("not set up"))?;
+        let tx = self.sender()?;
 
         let cursor_position = match (cursor_x, cursor_y) {
             (Some(x), Some(y)) => Some((x, y)),
@@ -600,8 +858,11 @@ impl InputCapturePortal {
     /// teardown paths where the task may be parked on a D-Bus reply that will
     /// never arrive, and blocking there (with or without the GIL) is how a
     /// shutdown turns into a hang. `try_send` is enough to ask it to stop.
-    fn close(&mut self) -> PyResult<()> {
-        if let Some(tx) = self.cmd_tx.take() {
+    ///
+    /// Takes `&self` on purpose: another thread may be parked inside
+    /// `release()` waiting for that same portal, and this is its way out.
+    fn close(&self) -> PyResult<()> {
+        if let Some(tx) = lock(&self.cmd_tx).take() {
             tx.try_send(Cmd::Close).ok();
         }
         Ok(())
@@ -610,7 +871,7 @@ impl InputCapturePortal {
 
 impl Drop for InputCapturePortal {
     fn drop(&mut self) {
-        if let Some(tx) = self.cmd_tx.take() {
+        if let Some(tx) = lock(&self.cmd_tx).take() {
             // try_send avoids panic if called from within the tokio runtime.
             tx.try_send(Cmd::Close).ok();
         }
@@ -751,19 +1012,30 @@ mod tests {
     }
 
     #[test]
-    fn segments_skip_non_axis_aligned_without_dropping_the_rest() {
+    fn segments_reject_non_axis_aligned_naming_the_index() {
         // A diagonal makes the portal reject the entire SetPointerBarriers
-        // call, so it is dropped here and its valid neighbours survive.
+        // call. Skipping it silently left the caller believing a span was
+        // armed when it was not, and with repeated labels the returned map
+        // could not say which one - so the whole call is refused, by index.
         let segments = vec![
             ("left".to_string(), 0, 0, 0, 500),
             ("diagonal".to_string(), 0, 0, 500, 500),
             ("right".to_string(), 1920, 0, 1920, 500),
         ];
-        let (barriers, barrier_map) = build_segment_barriers(&segments);
+        let err = validate_segments(&segments).unwrap_err();
 
-        assert_eq!(barriers.len(), 2);
-        assert_eq!(barrier_map[0].1, "left");
-        assert_eq!(barrier_map[1].1, "right");
+        assert!(err.contains("segment 1"), "{err}");
+        assert!(err.contains("diagonal"), "{err}");
+    }
+
+    #[test]
+    fn segments_accept_horizontal_and_vertical() {
+        let segments = vec![
+            ("left".to_string(), 0, 0, 0, 500),
+            ("top".to_string(), 0, 0, 500, 0),
+            ("point".to_string(), 7, 7, 7, 7),
+        ];
+        assert!(validate_segments(&segments).is_ok());
     }
 
     #[test]
@@ -882,6 +1154,61 @@ mod tests {
         assert!(slot.is_none(), "the sender is consumed by the success path");
 
         assert!(rx.blocking_recv().unwrap().is_ok());
+    }
+
+    #[test]
+    fn orphan_fd_is_closed_when_nobody_takes_the_setup_result() {
+        // The timed-out-setup path: the fd left ownership as a bare int inside
+        // the message, so if the receiver is gone the portal task is the only
+        // one left that can close it. Closing the write end of a socket pair
+        // is observable as EOF on the read end.
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        let raw = OwnedFd::from(writer).into_raw_fd();
+
+        close_orphan_fd(raw);
+
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            reader.read(&mut buf).unwrap(),
+            0,
+            "peer still open: the orphaned fd was leaked"
+        );
+    }
+
+    // timeout handling
+
+    #[test]
+    fn timeout_none_and_infinity_both_mean_forever() {
+        assert_eq!(deadline_from(None).unwrap(), None);
+        assert_eq!(deadline_from(Some(f64::INFINITY)).unwrap(), None);
+    }
+
+    #[test]
+    fn timeout_infinity_does_not_panic() {
+        // Duration::from_secs_f64(inf) panics; inf is a reasonable way for a
+        // caller to spell "wait forever", so it must not reach it.
+        assert!(deadline_from(Some(f64::INFINITY)).is_ok());
+        assert!(deadline_from(Some(f64::MAX)).is_ok());
+    }
+
+    #[test]
+    fn timeout_zero_and_negative_are_rejected() {
+        // Not "forever": a zero timeout is someone asking to fail fast, and
+        // reading it as an unbounded wait is the exact opposite.
+        assert!(deadline_from(Some(0.0)).is_err());
+        assert!(deadline_from(Some(-1.0)).is_err());
+        assert!(deadline_from(Some(f64::NAN)).is_err());
+    }
+
+    #[test]
+    fn timeout_positive_survives_as_a_duration() {
+        assert_eq!(
+            deadline_from(Some(0.25)).unwrap(),
+            Some(Duration::from_millis(250))
+        );
     }
 
     #[test]

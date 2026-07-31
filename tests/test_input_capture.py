@@ -33,6 +33,15 @@ class TestInstantiation:
         portal = InputCapturePortal()
         assert portal.activation_id == 0
 
+    def test_initial_barrier_map_empty(self):
+        portal = InputCapturePortal()
+        assert portal.barrier_map == []
+
+    def test_initial_zones_generation_zero(self):
+        # Bumped only when the compositor replaces the zones mid-session.
+        portal = InputCapturePortal()
+        assert portal.zones_generation == 0
+
     def test_multiple_instances(self):
         a = InputCapturePortal()
         b = InputCapturePortal()
@@ -118,15 +127,31 @@ class TestSetBarriers:
             portal.set_barriers(["left"], [("left", 0, 0, 0, 100)])
 
     def test_edges_and_segments_together_rejected(self):
-        # Checked before the "not set up" guard, so it surfaces even here.
+        # Conflicting arguments is a call error, so TypeError like the rest of
+        # Python. Checked before the "not set up" guard, so it surfaces here.
         portal = InputCapturePortal()
-        with pytest.raises(RuntimeError, match="not both"):
+        with pytest.raises(TypeError, match="not both"):
             portal.set_barriers(["left"], segments=[("left", 0, 0, 0, 100)])
 
-    def test_malformed_segment_raises_typeerror(self):
+    def test_malformed_segment_is_rejected(self):
+        # PyO3 reports a wrong-length tuple as ValueError, not the TypeError a
+        # pure-Python signature would raise; pin what the binding actually does.
         portal = InputCapturePortal()
-        with pytest.raises(TypeError):
+        with pytest.raises(ValueError, match="length 5"):
             portal.set_barriers(segments=[("left", 0, 300)])
+
+    def test_diagonal_segment_is_rejected_by_index(self):
+        # Dropping it silently would leave the caller believing that span is
+        # armed; labels can repeat, so the returned map cannot say which one
+        # went missing. Checked before the "not set up" guard.
+        portal = InputCapturePortal()
+        with pytest.raises(ValueError, match="segment 1"):
+            portal.set_barriers(
+                segments=[
+                    ("left", 0, 0, 0, 500),
+                    ("diagonal", 0, 0, 500, 500),
+                ]
+            )
 
     def test_after_close_raises_not_set_up(self):
         portal = InputCapturePortal()
@@ -186,15 +211,39 @@ class TestSetupNoBus:
         with pytest.raises(RuntimeError):
             portal.setup(edges=["left"], timeout=0.25)
 
+    @pytest.mark.timeout(30)
     def test_setup_accepts_none_timeout(self):
-        # None means "wait indefinitely"; with no bus it still fails fast.
+        # None means "wait indefinitely", so this test is only bounded by the
+        # bus being unreachable. The explicit mark makes a regression here fail
+        # as itself instead of hanging the whole suite, which is how it first
+        # showed up in CI.
         portal = InputCapturePortal()
         with pytest.raises(RuntimeError):
             portal.setup(["left"], None)
 
-    def test_double_setup_raises(self):
-        # Can't complete setup without a compositor; documents intent.
-        pass
+    def test_setup_rejects_a_zero_timeout(self):
+        # Zero reads as "fail fast", never as "wait forever".
+        portal = InputCapturePortal()
+        with pytest.raises(ValueError, match="greater than 0"):
+            portal.setup(None, 0.0)
+
+    def test_setup_rejects_a_negative_timeout(self):
+        portal = InputCapturePortal()
+        with pytest.raises(ValueError):
+            portal.setup(None, -1.0)
+
+    def test_setup_rejects_nan_timeout(self):
+        portal = InputCapturePortal()
+        with pytest.raises(ValueError, match="NaN"):
+            portal.setup(None, float("nan"))
+
+    @pytest.mark.timeout(30)
+    def test_setup_accepts_infinite_timeout(self):
+        # inf is a legitimate spelling of "wait forever"; it used to panic
+        # inside Duration::from_secs_f64.
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError):
+            portal.setup(None, float("inf"))
 
 
 class TestReleaseSignature:

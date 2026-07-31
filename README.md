@@ -96,32 +96,54 @@ Once a session is active, you can inspect activation state via properties:
 
 ```python
 portal.zones             # [(width, height, x_offset, y_offset), ...]
+portal.barrier_map       # [(barrier_id, label), ...] currently armed
+portal.zones_generation  # bumped when the zones changed and barriers re-armed
 portal.activation_id     # latest activation ID from the compositor
 portal.barrier_id        # barrier ID from the last Activated signal
 portal.cursor_position   # (x, y) cursor position at activation
 ```
 
+The compositor can replace the zones mid-session (monitor plugged in, resolution
+changed). When that happens the barriers are re-armed automatically and
+`zones_generation` changes — a cached `zones`/`barrier_map` must be re-read.
+
 ## API Reference
 
-| Method / Property              | Description                                                             |
-|--------------------------------|-------------------------------------------------------------------------|
-| `setup(edges=None)`            | Create session and set barriers. Returns `(zones, eis_fd, barrier_map)` |
-| `enable()`                     | Enable capture (barriers become active)                                 |
-| `disable()`                    | Disable capture (barriers deactivated)                                  |
-| `release(cursor_x, cursor_y)` | Release captured input, optionally reposition cursor                    |
-| `close()`                      | Close the session and shut down the background task                     |
-| `.zones`                       | Screen zones `[(w, h, x_off, y_off), ...]`                              |
-| `.activation_id`               | Latest activation ID                                                    |
-| `.barrier_id`                  | Barrier ID from last activation                                         |
-| `.cursor_position`             | Cursor `(x, y)` at last activation                                      |
+| Method / Property                            | Description                                                             |
+|----------------------------------------------|-------------------------------------------------------------------------|
+| `setup(edges=None, timeout=120.0)`           | Create session and set barriers. Returns `(zones, eis_fd, barrier_map)` |
+| `set_barriers(edges=None, *, segments=None)` | Re-arm barriers on the live session                                     |
+| `enable()`                                   | Enable capture (barriers become active)                                 |
+| `disable()`                                  | Disable capture (barriers deactivated)                                  |
+| `release(cursor_x, cursor_y)`                | Release captured input, optionally reposition cursor                    |
+| `close()`                                    | Close the session and shut down the background task                     |
+| `.zones`                                     | Screen zones `[(w, h, x_off, y_off), ...]`                              |
+| `.barrier_map`                               | Armed barriers `[(barrier_id, label), ...]`                             |
+| `.zones_generation`                          | Bumped when the zones changed and barriers were re-armed                |
+| `.activation_id`                             | Latest activation ID                                                    |
+| `.barrier_id`                                | Barrier ID from last activation                                         |
+| `.cursor_position`                           | Cursor `(x, y)` at last activation                                      |
+
+`timeout` (seconds) bounds the wait for the permission dialog: `None` waits
+indefinitely and Ctrl-C still works, `0` or negative raises `ValueError`.
+
+`set_barriers` takes either `edges` (whole zone edges by name) or `segments` —
+`(label, x1, y1, x2, y2)` axis-aligned lines in absolute desktop coordinates,
+for when a client abuts only part of an edge — and returns the new
+`barrier_map`. Passing both raises `TypeError`; a diagonal segment raises
+`ValueError` naming its index. It reuses the live session on purpose:
+re-running `setup` is what hangs the GNOME portal.
 
 ## Development
 
 ```bash
+# Dev tooling (maturin, pytest, pytest-timeout)
+pip install -e ".[dev]"
+
 # Build and install in dev mode
 maturin develop
 
-# Run tests
+# Run tests (Rust + Python)
 make test
 ```
 

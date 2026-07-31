@@ -7,7 +7,21 @@ class InputCapturePortal:
 
     @property
     def zones(self) -> list[tuple[int, int, int, int]]:
-        """Screen zones as [(width, height, x_offset, y_offset), ...]."""
+        """Screen zones as [(width, height, x_offset, y_offset), ...].
+
+        Re-read after `zones_generation` changes: the compositor can replace
+        them mid-session.
+        """
+        ...
+
+    @property
+    def barrier_map(self) -> list[tuple[int, str]]:
+        """Currently armed barriers as [(barrier_id, label), ...]."""
+        ...
+
+    @property
+    def zones_generation(self) -> int:
+        """Bumped whenever the zones changed and the barriers were re-armed."""
         ...
 
     @property
@@ -35,13 +49,10 @@ class InputCapturePortal:
         Returns (zones, eis_fd, barrier_map).
 
         Blocks until the portal answers — on GNOME, until the user answers the
-        permission dialog — but releases the GIL while waiting. `timeout`
-        (seconds) bounds that wait; pass None to wait indefinitely.
+        permission dialog — but releases the GIL while waiting, so Ctrl-C still
+        works. `timeout` (seconds) bounds that wait; pass None to wait
+        indefinitely. Zero or negative raises ValueError.
         """
-        ...
-
-    def poll_activated(self) -> tuple[int, float, float] | None:
-        """Pop the next Activated event from the queue, or None."""
         ...
 
     def enable(self) -> None:
@@ -58,7 +69,9 @@ class InputCapturePortal:
 
         Pass either `edges` (whole zone edges by name, None = all of them) or
         `segments` ((label, x1, y1, x2, y2) axis-aligned lines in absolute
-        desktop coordinates, for an edge only partly abutted) — not both.
+        desktop coordinates, for an edge only partly abutted) — not both,
+        which raises TypeError. A non-axis-aligned segment raises ValueError
+        naming its index.
 
         Returns the new barrier_map, minus any barrier the compositor
         rejected. Reuses the current session (re-running setup hangs the
