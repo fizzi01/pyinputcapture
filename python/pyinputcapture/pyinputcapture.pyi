@@ -39,6 +39,17 @@ class InputCapturePortal:
         """Cursor position (x, y) from the last Activated signal."""
         ...
 
+    @property
+    def last_error(self) -> str | None:
+        """The portal task's last error, or None.
+
+        The only way to recover a *late* failure: the task can fail only after
+        `setup()` has returned or given up, and a caller that redirects fd 2
+        (to silence libei's dispatch spam) would otherwise never see the
+        reason. Cleared at the start of every `setup()`.
+        """
+        ...
+
     def setup(
         self,
         edges: list[str] | None = None,

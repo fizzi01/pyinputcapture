@@ -43,6 +43,16 @@ class AsyncInputCapturePortal:
         return self._portal.cursor_position
 
     @property
+    def last_error(self) -> Optional[str]:
+        """The portal task's last error, or None.
+
+        A task can only fail after ``setup()`` has returned or given up, so this
+        is the only place such a reason is recoverable - it used to go to stderr
+        and be discarded by any caller that redirects fd 2.
+        """
+        return self._portal.last_error
+
+    @property
     def activation(self) -> tuple[int, int, tuple[float, float]]:
         """`(activation_id, barrier_id, (x, y))` of the last barrier hit.
 

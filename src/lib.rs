@@ -1,8 +1,9 @@
 //! PyO3 wrapper around ashpd's XDG InputCapture portal.
 //!
-//! Exposes `InputCapturePortal` to Python: a blocking API backed by a
-//! tokio runtime.  Python communicates with the background task through
-//! channels.
+//! Exposes `InputCapturePortal` to Python: a blocking API backed by one
+//! process-wide tokio runtime (see `RUNTIME` - it is shared because ashpd's
+//! D-Bus connection is).  Python communicates with the background task
+//! through channels.
 //!
 //! Activation data (barrier_id, cursor position) is shared via atomics
 //! packed in a single `SharedActivation` struct behind one `Arc`.
@@ -10,10 +11,11 @@
 //! a Python `Acquire` load that sees the new ID is guaranteed to also
 //! see the corresponding barrier_id and cursor position.
 
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use ashpd::desktop::input_capture::{ActivatedBarrier, Barrier, Capabilities, InputCapture};
@@ -29,6 +31,78 @@ use tokio::sync::{mpsc, oneshot};
 /// thread from turning every later call into an error.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The one tokio runtime of the process, shared by every portal object.
+///
+/// **Load-bearing, and the reason a cancelled permission dialog can be asked
+/// for again.** `ashpd` caches the D-Bus session connection in a process-global
+/// static (`static SESSION: OnceLock<zbus::Connection>` in its `proxy.rs`), so
+/// every `InputCapture::new()` in the process reuses the *same* connection —
+/// and that connection's zbus tasks live on whichever runtime created it first.
+///
+/// With a runtime per portal object, dropping one object shut its runtime down
+/// and killed those tasks while the now-dead connection stayed in ashpd's
+/// static. A process-global connection needs a process-global runtime to carry it.
+static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn runtime() -> PyResult<&'static tokio::runtime::Runtime> {
+    if let Some(rt) = RUNTIME.get() {
+        return Ok(rt);
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
+    // A concurrent caller may have won the race; theirs is as good as ours and
+    // the loser's runtime is dropped here with nothing spawned on it.
+    Ok(RUNTIME.get_or_init(|| rt))
+}
+
+/// Slack added to the caller's deadline before the portal task gives up.
+///
+/// The task's bound exists only so a request nobody will ever answer ends
+/// instead of parking a worker forever - it must not be what *reports* the
+/// timeout, because the task's error reaches Python only as a late `last_error`.
+/// Python's own `wait_for_setup` has to expire first.
+const SETUP_DEADLINE_MARGIN: Duration = Duration::from_secs(5);
+
+/// Everything up to the moment `setup()`'s result is handed to Python waits on
+/// the portal, and the very first step waits on a human answering the permission
+/// dialog. Since the task now outlives the `InputCapturePortal` object that
+/// spawned it (the runtime is shared and never shut down), an unanswered dialog
+/// would otherwise park a worker for the rest of the process's life.
+///
+/// `None` - the caller asked to wait indefinitely - stays unbounded, as before.
+struct SetupBudget {
+    until: Option<Instant>,
+}
+
+impl SetupBudget {
+    fn new(limit: Option<Duration>) -> Self {
+        Self {
+            until: limit.map(|d| Instant::now() + d + SETUP_DEADLINE_MARGIN),
+        }
+    }
+
+    /// Await `fut`, failing with a named error once the budget is spent.
+    async fn guard<T>(
+        &self,
+        what: &str,
+        fut: impl Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
+        let Some(until) = self.until else {
+            return fut.await;
+        };
+        let left = until.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "{what}: the portal did not answer within the setup deadline"
+            )),
+        }
+    }
 }
 
 enum Cmd {
@@ -220,9 +294,10 @@ async fn run_portal(
     shared: &SharedActivation,
     state: &Mutex<SessionState>,
     active_edges: Option<Vec<String>>,
+    budget: &SetupBudget,
 ) -> Result<(), String> {
     let mut setup_tx = Some(setup_tx);
-    let result = portal_session(&mut setup_tx, cmd_rx, shared, state, active_edges).await;
+    let result = portal_session(&mut setup_tx, cmd_rx, shared, state, active_edges, budget).await;
     if let Err(e) = &result {
         // Still Some ⇒ we failed before handing the session over.
         if let Some(tx) = setup_tx.take() {
@@ -307,24 +382,44 @@ async fn portal_session(
     shared: &SharedActivation,
     state: &Mutex<SessionState>,
     active_edges: Option<Vec<String>>,
+    budget: &SetupBudget,
 ) -> Result<(), String> {
     // Create portal proxy
-    let ic = InputCapture::new()
-        .await
-        .map_err(|e| format!("InputCapture::new: {e}"))?;
+    let ic = budget
+        .guard("InputCapture::new", async {
+            InputCapture::new()
+                .await
+                .map_err(|e| format!("InputCapture::new: {e}"))
+        })
+        .await?;
 
     // Create session. On GNOME this is what raises the permission dialog, so it
     // stays pending for as long as the user takes to answer it - which is why the
-    // Python caller must not be holding the GIL while it runs.
-    let (session, _caps) = ic
-        .create_session(
-            None::<&ashpd::WindowIdentifier>,
-            Capabilities::Keyboard | Capabilities::Pointer | Capabilities::Touchscreen,
-        )
-        .await
-        .map_err(|e| format!("create_session: {e}"))?;
+    // Python caller must not be holding the GIL while it runs, and why the budget
+    // above it is what keeps a dialog nobody answers from parking this task
+    // forever (it now outlives the object that spawned it).
+    let (session, _caps) = budget
+        .guard("create_session", async {
+            ic.create_session(
+                None::<&ashpd::WindowIdentifier>,
+                Capabilities::Keyboard | Capabilities::Pointer | Capabilities::Touchscreen,
+            )
+            .await
+            .map_err(|e| format!("create_session: {e}"))
+        })
+        .await?;
 
-    let result = live_session(&ic, &session, setup_tx, cmd_rx, shared, state, active_edges).await;
+    let result = live_session(
+        &ic,
+        &session,
+        setup_tx,
+        cmd_rx,
+        shared,
+        state,
+        active_edges,
+        budget,
+    )
+    .await;
 
     // Hand the session back however we got here. Dropping the proxy alone
     // leaves it alive on the compositor side, and one of the ways here is a
@@ -344,14 +439,20 @@ async fn live_session(
     shared: &SharedActivation,
     state: &Mutex<SessionState>,
     active_edges: Option<Vec<String>>,
+    budget: &SetupBudget,
 ) -> Result<(), String> {
-    // Get zones
-    let zones_resp = ic
-        .zones(session)
-        .await
-        .map_err(|e| format!("zones request: {e}"))?
-        .response()
-        .map_err(|e| format!("zones response: {e}"))?;
+    // Get zones. Still inside the budget: everything up to the `Ok` handed back
+    // to Python waits on the portal, and a task that outlives its object must
+    // not be able to park on any of it.
+    let zones_resp = budget
+        .guard("zones", async {
+            ic.zones(session)
+                .await
+                .map_err(|e| format!("zones request: {e}"))?
+                .response()
+                .map_err(|e| format!("zones response: {e}"))
+        })
+        .await?;
 
     {
         let mut st = lock(state);
@@ -367,13 +468,21 @@ async fn live_session(
     // a refresh must reproduce what the caller last asked for, not the default.
     let mut spec = BarrierSpec::Edges(active_edges);
 
-    let barrier_map = arm_barriers(ic, session, &spec, state).await?;
+    let barrier_map = budget
+        .guard(
+            "set_pointer_barriers",
+            arm_barriers(ic, session, &spec, state),
+        )
+        .await?;
 
     // Connect to EIS
-    let eis_fd: OwnedFd = ic
-        .connect_to_eis(session)
-        .await
-        .map_err(|e| format!("connect_to_eis: {e}"))?;
+    let eis_fd: OwnedFd = budget
+        .guard("connect_to_eis", async {
+            ic.connect_to_eis(session)
+                .await
+                .map_err(|e| format!("connect_to_eis: {e}"))
+        })
+        .await?;
 
     // Send setup results back to Python
     let zones = lock(state).zones.clone();
@@ -585,18 +694,20 @@ fn wait_for_setup(
 /// number: when it changes, a new barrier was hit.
 #[pyclass]
 struct InputCapturePortal {
-    rt: tokio::runtime::Runtime,
     /// Behind a mutex so every method can take `&self`. With `&mut self` on
     /// `close`, PyO3's runtime borrow check refused the call whenever another
     /// thread sat inside `release`/`enable` with the GIL released - i.e.
     /// exactly when a second thread needs to break the deadlock.
     cmd_tx: Mutex<Option<mpsc::Sender<Cmd>>>,
-    /// The task of a `setup()` that timed out may still be finishing (a late
-    /// answer to the permission dialog). Starting a second one meanwhile would
-    /// leave two portal sessions alive, only one of them reachable.
-    pending: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shared: Arc<SharedActivation>,
     state: Arc<Mutex<SessionState>>,
+    /// Last error the portal task reported, readable from Python.
+    ///
+    /// The task can only fail *after* `setup()` has returned - a late answer to
+    /// a dialog, a session that died - and that reason used to go to stderr,
+    /// which a caller that points fd 2 at /dev/null (to silence libei's dispatch
+    /// spam) discards. Then the only account of the failure was gone.
+    last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl InputCapturePortal {
@@ -617,18 +728,15 @@ impl InputCapturePortal {
     /// Create a new portal handle.  Call `setup` to connect.
     #[new]
     fn new() -> PyResult<Self> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
+        // Built here rather than lazily in `setup` only so a runtime that cannot
+        // be created is reported by the constructor, as it always was.
+        runtime()?;
 
         Ok(Self {
-            rt,
             cmd_tx: Mutex::new(None),
-            pending: Mutex::new(None),
             shared: Arc::new(SharedActivation::new()),
             state: Arc::new(Mutex::new(SessionState::default())),
+            last_error: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -653,55 +761,52 @@ impl InputCapturePortal {
         if lock(&self.cmd_tx).is_some() {
             return Err(PyRuntimeError::new_err("already set up"));
         }
-        {
-            // A task from an earlier attempt that timed out may still be
-            // creating a session; a second one now would leave the first alive
-            // and unreachable.
-            let mut pending = lock(&self.pending);
-            match pending.as_ref() {
-                Some(handle) if !handle.is_finished() => {
-                    return Err(PyRuntimeError::new_err(
-                        "a previous setup is still winding down (the portal has not \
-                         answered it yet); retry once it has",
-                    ));
-                }
-                _ => *pending = None,
-            }
-        }
 
         let (setup_tx, setup_rx) = oneshot::channel();
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let shared = self.shared.clone();
         let state = self.state.clone();
+        let last_error = self.last_error.clone();
 
         // Reset atomics for the new session
         self.shared.reset();
         *lock(&self.state) = SessionState::default();
+        *lock(&self.last_error) = None;
 
-        let task = self.rt.spawn(async move {
-            if let Err(e) = run_portal(setup_tx, cmd_rx, &shared, &state, edges).await {
-                eprintln!("pyinputcapture: portal task error: {e}");
+        let rt = runtime()?;
+        rt.spawn(async move {
+            let budget = SetupBudget::new(deadline);
+            if let Err(e) = run_portal(setup_tx, cmd_rx, &shared, &state, edges, &budget).await {
+                *lock(&last_error) = Some(e);
             }
         });
 
-        let handle = self.rt.handle().clone();
-        let result = match wait_for_setup(py, &handle, setup_rx, deadline) {
+        let result = match wait_for_setup(py, rt.handle(), setup_rx, deadline) {
             Ok(result) => result,
             Err(e) => {
                 // Dropping `cmd_tx` here closes the command channel, which the
                 // task reads as a Close; `portal_session` then closes whatever
-                // session it managed to create. Track the task so the next
-                // `setup()` does not race it.
+                // session it managed to create. The task itself needs no
+                // tracking: its setup phase is bounded by `SetupBudget`, so it
+                // ends on its own rather than parking on an unanswered dialog.
                 drop(cmd_tx);
-                *lock(&self.pending) = Some(task);
                 return Err(e);
             }
         };
 
         *lock(&self.cmd_tx) = Some(cmd_tx);
-        *lock(&self.pending) = None;
 
         Ok((result.zones, result.eis_raw_fd, result.barrier_map))
+    }
+
+    /// The portal task's last error, or `None`.
+    ///
+    /// The one place a *late* failure is recoverable from: a task can only fail
+    /// after `setup()` has already returned or given up, and its reason has
+    /// nowhere else to go. Cleared at the start of every `setup()`.
+    #[getter]
+    fn last_error(&self) -> Option<String> {
+        lock(&self.last_error).clone()
     }
 
     /// Screen zones as `[(width, height, x_offset, y_offset), ...]`.
@@ -869,22 +974,20 @@ impl InputCapturePortal {
     }
 }
 
+/// Asking the session to close is all a drop does.
+///
+/// It deliberately does **not** touch the runtime. That runtime is shared by the
+/// whole process and carries ashpd's process-global D-Bus connection (see
+/// `RUNTIME`): shutting it down here killed the connection's zbus tasks, after
+/// which every later portal request in the process was accepted and never
+/// answered. Never dropping the runtime also settles, for free, the problem the
+/// old code worked around - dropping a multi-thread runtime under the GIL blocks
+/// on workers that may be parked on a portal reply, freezing the interpreter.
 impl Drop for InputCapturePortal {
     fn drop(&mut self) {
         if let Some(tx) = lock(&self.cmd_tx).take() {
             // try_send avoids panic if called from within the tokio runtime.
             tx.try_send(Cmd::Close).ok();
-        }
-        // Dropping a multi-threaded Runtime blocks until its workers wind down,
-        // and a worker awaiting a portal reply may never finish - which, during
-        // Python GC with the GIL held, freezes the whole interpreter. Hand the
-        // runtime to a background thread to wind down on its own instead.
-        //
-        // Replace the runtime with a throwaway current-thread one (which has
-        // nothing to wind down) so we can move the real one out of &mut self.
-        if let Ok(placeholder) = tokio::runtime::Builder::new_current_thread().build() {
-            let rt = std::mem::replace(&mut self.rt, placeholder);
-            rt.shutdown_background();
         }
     }
 }
@@ -1003,8 +1106,7 @@ mod tests {
         // arm a barrier along the rest of it.
         let zones = vec![(1920, 1080, 0, 0)];
         let (whole_edge, _) = build_barriers(&zones, Some(&["left".to_string()]));
-        let (partial, map) =
-            build_segment_barriers(&[("left".to_string(), 0, 300, 0, 800)]);
+        let (partial, map) = build_segment_barriers(&[("left".to_string(), 0, 300, 0, 800)]);
 
         assert_eq!(whole_edge.len(), 1);
         assert_eq!(partial.len(), 1);
@@ -1130,7 +1232,9 @@ mod tests {
         assert!(fake_run(tx, Some("create_session")).is_err());
 
         // Not a bare channel-closed: the cause survives the hop to Python.
-        let err = rx.blocking_recv().expect("sender must not be dropped unsent");
+        let err = rx
+            .blocking_recv()
+            .expect("sender must not be dropped unsent");
         assert_eq!(err.unwrap_err(), "create_session: boom");
     }
 
@@ -1262,8 +1366,14 @@ mod tests {
         let aid = s.activation_id.load(Ordering::Acquire);
         assert_eq!(aid, 1);
         assert_eq!(s.barrier_id.load(Ordering::Relaxed), 3);
-        assert_eq!(f64::from_bits(s.cursor_pos_x.load(Ordering::Relaxed)), 100.0);
-        assert_eq!(f64::from_bits(s.cursor_pos_y.load(Ordering::Relaxed)), 200.0);
+        assert_eq!(
+            f64::from_bits(s.cursor_pos_x.load(Ordering::Relaxed)),
+            100.0
+        );
+        assert_eq!(
+            f64::from_bits(s.cursor_pos_y.load(Ordering::Relaxed)),
+            200.0
+        );
     }
 
     #[test]
@@ -1385,5 +1495,96 @@ mod tests {
             .enable_all()
             .build();
         assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn runtime_is_one_per_process() {
+        // The whole fix: ashpd caches the D-Bus session connection in a
+        // process-global static, so the runtime carrying that connection's zbus
+        // tasks has to be process-global too. A second runtime here would mean a
+        // portal object able to outlive the connection every other object uses.
+        let a = runtime().unwrap();
+        let b = runtime().unwrap();
+        assert!(std::ptr::eq(a, b), "every portal object shares one runtime");
+    }
+
+    // setup budget
+
+    #[test]
+    fn budget_none_never_expires() {
+        // `timeout=None` means "wait indefinitely", and that has to survive as
+        // an unbounded await rather than becoming some large finite one.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let budget = SetupBudget::new(None);
+
+        let out = rt.block_on(async {
+            budget
+                .guard("create_session", async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok::<_, String>(7)
+                })
+                .await
+        });
+        assert_eq!(out.unwrap(), 7);
+    }
+
+    #[test]
+    fn budget_ends_a_request_nobody_answers() {
+        // The task outlives the portal object now, so a dialog left on screen
+        // forever must end its task instead of parking a worker for the life of
+        // the process.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let err = rt.block_on(async {
+            let budget = SetupBudget::new(Some(Duration::from_millis(10)));
+            budget
+                .guard("create_session", async {
+                    std::future::pending::<Result<(), String>>().await
+                })
+                .await
+                .unwrap_err()
+        });
+        assert!(err.contains("create_session"), "{err}");
+        assert!(err.contains("setup deadline"), "{err}");
+    }
+
+    #[test]
+    fn budget_leaves_the_caller_room_to_report_first() {
+        // Python's own wait must expire before the task's does: the task's error
+        // only ever surfaces as a late `last_error`, so if it won the race the
+        // caller would get the generic channel-closed instead of the timeout.
+        assert!(SETUP_DEADLINE_MARGIN > Duration::ZERO);
+    }
+
+    #[test]
+    fn budget_spans_every_step_before_the_result() {
+        // One budget for the whole pre-`Ok` phase, not one per call: two steps
+        // that each finish inside the deadline can still exceed it together.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let second = rt.block_on(async {
+            let budget = SetupBudget::new(Some(Duration::ZERO));
+            let first = budget
+                .guard("create_session", async { Ok::<_, String>(()) })
+                .await;
+            assert!(first.is_ok(), "a step that needs no waiting still passes");
+            budget
+                .guard("zones", async {
+                    std::future::pending::<Result<(), String>>().await
+                })
+                .await
+        });
+        assert!(second.is_err(), "the budget is shared, not per step");
     }
 }

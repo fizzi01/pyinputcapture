@@ -246,6 +246,69 @@ class TestSetupNoBus:
             portal.setup(None, float("inf"))
 
 
+class TestLastError:
+    """The late-failure channel.
+
+    A portal task can only fail *after* ``setup()`` has returned or given up, and
+    its reason used to go to stderr - which the daemon points at /dev/null for the
+    lifetime of its capture thread (libei's dispatch spam), so the one account of
+    the failure was discarded.
+    """
+
+    def test_starts_empty(self):
+        portal = InputCapturePortal()
+        assert portal.last_error is None
+
+    def test_survives_a_close(self):
+        portal = InputCapturePortal()
+        portal.close()
+        assert portal.last_error is None
+
+    @pytest.mark.skipif(
+        sys.platform != "linux",
+        reason="InputCapture portal only works on Linux",
+    )
+    def test_a_failed_setup_leaves_a_reason(self, monkeypatch):
+        monkeypatch.setenv(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/nonexistent/pyinputcapture-test-bus",
+        )
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        portal = InputCapturePortal()
+        with pytest.raises(RuntimeError):
+            portal.setup(["left"], 0.25)
+
+        assert portal.last_error, "the task's reason has nowhere else to go"
+
+
+class TestSharedRuntime:
+    """Dropping a portal object must not disturb the next one.
+
+    ashpd caches the D-Bus session connection in a process-global static, so the
+    runtime carrying that connection's zbus tasks is process-global too. When it
+    was per-object, dropping one object shut its runtime down and killed those
+    tasks while the dead connection stayed cached: every later request in the
+    process was then accepted and never answered - the reason a cancelled
+    permission dialog never came back. Only a live compositor can show that
+    end to end; what is reachable here is that the churn is survivable at all.
+    """
+
+    def test_many_objects_come_and_go(self):
+        for _ in range(20):
+            portal = InputCapturePortal()
+            portal.close()
+            del portal
+
+    def test_an_object_outlives_its_predecessors(self):
+        survivor = InputCapturePortal()
+        for _ in range(5):
+            InputCapturePortal().close()
+        # Reaching the "not set up" guard proves the object is still functional
+        # after every predecessor was dropped.
+        with pytest.raises(RuntimeError, match="not set up"):
+            survivor.enable()
+
+
 class TestReleaseSignature:
     def test_release_no_args(self):
         portal = InputCapturePortal()
