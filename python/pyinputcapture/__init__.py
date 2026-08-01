@@ -28,7 +28,7 @@ Quick start (async)::
 from pyinputcapture.pyinputcapture import InputCapturePortal
 from pyinputcapture._async import AsyncInputCapturePortal
 
-__version__ = "0.2.0"  # x-release-please-version
+__version__ = "0.3.0"  # x-release-please-version
 
 __all__ = [
     "InputCapturePortal",

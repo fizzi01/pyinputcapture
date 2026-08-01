@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/fizzi01/pyinputcapture/compare/v0.2.0...v0.3.0) (2026-08-01)
+
+
+### Features
+
+* add set_barriers method ([#4](https://github.com/fizzi01/pyinputcapture/issues/4)) ([68ed3c0](https://github.com/fizzi01/pyinputcapture/commit/68ed3c055803f092768fe9ecfe52dcec8b8172f2))
+
+
+### Bug Fixes
+
+* keep InputCapturePortal usable after recreation ([#6](https://github.com/fizzi01/pyinputcapture/issues/6)) ([fb4c393](https://github.com/fizzi01/pyinputcapture/commit/fb4c393a389e8a88edf943ed61d4f690cc9e001e))
+
 ## [0.2.0](https://github.com/fizzi01/pyinputcapture/compare/v0.1.1...v0.2.0) (2026-03-10)
 
 
