@@ -123,9 +123,24 @@ changed). When that happens the barriers are re-armed automatically and
 | `.activation_id`                             | Latest activation ID                                                    |
 | `.barrier_id`                                | Barrier ID from last activation                                         |
 | `.cursor_position`                           | Cursor `(x, y)` at last activation                                      |
+| `.last_error`                                | Portal task's last error, or `None`; cleared by `setup()`               |
 
 `timeout` (seconds) bounds the wait for the permission dialog: `None` waits
 indefinitely and Ctrl-C still works, `0` or negative raises `ValueError`.
+
+`last_error` is the only way to see a failure the task hit *after* `setup()`
+returned or gave up — a late answer to a dialog, a session the compositor
+dropped. It used to go to stderr, which a caller that redirects fd 2 discards.
+
+**One tokio runtime per process, shared by every portal object, never shut
+down.** `ashpd` caches the D-Bus session connection in a process-global static,
+so every `InputCapture::new()` reuses it and its zbus tasks live on whichever
+runtime created it first. Before 0.3.0 each portal object built its own runtime
+and shut it down on `Drop`, killing those tasks while the dead connection stayed
+cached: from then on every portal request in the process was accepted and never
+answered, so a permission dialog cancelled once never came back. The setup phase
+of the task is bounded (the caller's `timeout` plus a small margin) because the
+task now outlives the object that spawned it.
 
 `set_barriers` takes either `edges` (whole zone edges by name) or `segments` —
 `(label, x1, y1, x2, y2)` axis-aligned lines in absolute desktop coordinates,
