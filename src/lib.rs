@@ -35,15 +35,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The one tokio runtime of the process, shared by every portal object.
 ///
-/// **Load-bearing, and the reason a cancelled permission dialog can be asked
-/// for again.** `ashpd` caches the D-Bus session connection in a process-global
-/// static (`static SESSION: OnceLock<zbus::Connection>` in its `proxy.rs`), so
-/// every `InputCapture::new()` in the process reuses the *same* connection —
-/// and that connection's zbus tasks live on whichever runtime created it first.
-///
-/// With a runtime per portal object, dropping one object shut its runtime down
-/// and killed those tasks while the now-dead connection stayed in ashpd's
-/// static. A process-global connection needs a process-global runtime to carry it.
+/// Load-bearing: `ashpd` caches the D-Bus session connection in a process-global
+/// static, and that connection's zbus tasks live on whichever runtime created it
+/// first. A per-object runtime shut down on `Drop` kills them, after which every
+/// portal request in the process is accepted and never answered.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn runtime() -> PyResult<&'static tokio::runtime::Runtime> {
@@ -60,21 +55,14 @@ fn runtime() -> PyResult<&'static tokio::runtime::Runtime> {
     Ok(RUNTIME.get_or_init(|| rt))
 }
 
-/// Slack added to the caller's deadline before the portal task gives up.
-///
-/// The task's bound exists only so a request nobody will ever answer ends
-/// instead of parking a worker forever - it must not be what *reports* the
-/// timeout, because the task's error reaches Python only as a late `last_error`.
-/// Python's own `wait_for_setup` has to expire first.
+/// Slack over the caller's deadline, so Python's own wait reports the timeout
+/// first: the task's error only reaches it as a late `last_error`.
 const SETUP_DEADLINE_MARGIN: Duration = Duration::from_secs(5);
 
-/// Everything up to the moment `setup()`'s result is handed to Python waits on
-/// the portal, and the very first step waits on a human answering the permission
-/// dialog. Since the task now outlives the `InputCapturePortal` object that
-/// spawned it (the runtime is shared and never shut down), an unanswered dialog
-/// would otherwise park a worker for the rest of the process's life.
-///
-/// `None` - the caller asked to wait indefinitely - stays unbounded, as before.
+/// Bounds the whole pre-`Ok` phase of a session, all of which waits on the
+/// portal and the first step of which waits on a human. The task outlives the
+/// object that spawned it, so an unanswered dialog would otherwise park a
+/// worker for the life of the process. `None` stays unbounded.
 struct SetupBudget {
     until: Option<Instant>,
 }
@@ -393,11 +381,9 @@ async fn portal_session(
         })
         .await?;
 
-    // Create session. On GNOME this is what raises the permission dialog, so it
-    // stays pending for as long as the user takes to answer it - which is why the
-    // Python caller must not be holding the GIL while it runs, and why the budget
-    // above it is what keeps a dialog nobody answers from parking this task
-    // forever (it now outlives the object that spawned it).
+    // Create session. On GNOME this is what raises the permission dialog and
+    // stays pending until the user answers it, so the Python caller must not
+    // hold the GIL across it, and the budget is what bounds it.
     let (session, _caps) = budget
         .guard("create_session", async {
             ic.create_session(
@@ -441,9 +427,8 @@ async fn live_session(
     active_edges: Option<Vec<String>>,
     budget: &SetupBudget,
 ) -> Result<(), String> {
-    // Get zones. Still inside the budget: everything up to the `Ok` handed back
-    // to Python waits on the portal, and a task that outlives its object must
-    // not be able to park on any of it.
+    // Still inside the budget: every step up to the `Ok` handed back to Python
+    // waits on the portal, and none of them may park the task.
     let zones_resp = budget
         .guard("zones", async {
             ic.zones(session)
@@ -701,12 +686,8 @@ struct InputCapturePortal {
     cmd_tx: Mutex<Option<mpsc::Sender<Cmd>>>,
     shared: Arc<SharedActivation>,
     state: Arc<Mutex<SessionState>>,
-    /// Last error the portal task reported, readable from Python.
-    ///
-    /// The task can only fail *after* `setup()` has returned - a late answer to
-    /// a dialog, a session that died - and that reason used to go to stderr,
-    /// which a caller that points fd 2 at /dev/null (to silence libei's dispatch
-    /// spam) discards. Then the only account of the failure was gone.
+    /// Last error the portal task reported. It can only fail after `setup()`
+    /// returned, and stderr may well be pointed at /dev/null by the caller.
     last_error: Arc<Mutex<Option<String>>>,
 }
 
@@ -784,11 +765,10 @@ impl InputCapturePortal {
         let result = match wait_for_setup(py, rt.handle(), setup_rx, deadline) {
             Ok(result) => result,
             Err(e) => {
-                // Dropping `cmd_tx` here closes the command channel, which the
-                // task reads as a Close; `portal_session` then closes whatever
-                // session it managed to create. The task itself needs no
-                // tracking: its setup phase is bounded by `SetupBudget`, so it
-                // ends on its own rather than parking on an unanswered dialog.
+                // Dropping `cmd_tx` closes the command channel, which the task
+                // reads as a Close; `portal_session` then closes whatever
+                // session it created. The task needs no tracking - `SetupBudget`
+                // bounds it.
                 drop(cmd_tx);
                 return Err(e);
             }
@@ -801,9 +781,8 @@ impl InputCapturePortal {
 
     /// The portal task's last error, or `None`.
     ///
-    /// The one place a *late* failure is recoverable from: a task can only fail
-    /// after `setup()` has already returned or given up, and its reason has
-    /// nowhere else to go. Cleared at the start of every `setup()`.
+    /// The only channel for a failure the task hits after `setup()` returned or
+    /// gave up. Cleared at the start of every `setup()`.
     #[getter]
     fn last_error(&self) -> Option<String> {
         lock(&self.last_error).clone()
@@ -976,13 +955,9 @@ impl InputCapturePortal {
 
 /// Asking the session to close is all a drop does.
 ///
-/// It deliberately does **not** touch the runtime. That runtime is shared by the
-/// whole process and carries ashpd's process-global D-Bus connection (see
-/// `RUNTIME`): shutting it down here killed the connection's zbus tasks, after
-/// which every later portal request in the process was accepted and never
-/// answered. Never dropping the runtime also settles, for free, the problem the
-/// old code worked around - dropping a multi-thread runtime under the GIL blocks
-/// on workers that may be parked on a portal reply, freezing the interpreter.
+/// It must not touch the runtime, which is shared by the whole process (see
+/// `RUNTIME`). Never dropping it also keeps a drop under the GIL from blocking
+/// on a worker parked on a portal reply.
 impl Drop for InputCapturePortal {
     fn drop(&mut self) {
         if let Some(tx) = lock(&self.cmd_tx).take() {
@@ -1499,10 +1474,8 @@ mod tests {
 
     #[test]
     fn runtime_is_one_per_process() {
-        // The whole fix: ashpd caches the D-Bus session connection in a
-        // process-global static, so the runtime carrying that connection's zbus
-        // tasks has to be process-global too. A second runtime here would mean a
-        // portal object able to outlive the connection every other object uses.
+        // ashpd's D-Bus connection is process-global, so the runtime carrying
+        // its zbus tasks has to be too.
         let a = runtime().unwrap();
         let b = runtime().unwrap();
         assert!(std::ptr::eq(a, b), "every portal object shares one runtime");
@@ -1533,9 +1506,8 @@ mod tests {
 
     #[test]
     fn budget_ends_a_request_nobody_answers() {
-        // The task outlives the portal object now, so a dialog left on screen
-        // forever must end its task instead of parking a worker for the life of
-        // the process.
+        // The task outlives the portal object, so a dialog nobody ever answers
+        // must end it instead of parking a worker for the life of the process.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .start_paused(true)
@@ -1557,9 +1529,8 @@ mod tests {
 
     #[test]
     fn budget_leaves_the_caller_room_to_report_first() {
-        // Python's own wait must expire before the task's does: the task's error
-        // only ever surfaces as a late `last_error`, so if it won the race the
-        // caller would get the generic channel-closed instead of the timeout.
+        // Python's wait must expire first: the task's error only surfaces as a
+        // late `last_error`, so winning the race would hide the real timeout.
         assert!(SETUP_DEADLINE_MARGIN > Duration::ZERO);
     }
 
