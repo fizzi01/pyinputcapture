@@ -10,6 +10,10 @@
 //! `activation_id` is written **last** with `Release` ordering so that
 //! a Python `Acquire` load that sees the new ID is guaranteed to also
 //! see the corresponding barrier_id and cursor position.
+//!
+//! `RemoteDesktopPortal` (see `remote_desktop`) shares the runtime and the
+//! D-Bus connection, which is what lets one `register_host_app` call cover
+//! every portal object in the process.
 
 use std::future::Future;
 use std::num::NonZeroU32;
@@ -25,11 +29,13 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use tokio::sync::{mpsc, oneshot};
 
+mod remote_desktop;
+
 /// A poisoned lock only means some other thread panicked while holding it; the
 /// data behind it is a plain snapshot of portal geometry, so there is nothing
 /// to salvage or invalidate. Taking the inner value keeps a panic in one Python
 /// thread from turning every later call into an error.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -41,7 +47,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// portal request in the process is accepted and never answered.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
-fn runtime() -> PyResult<&'static tokio::runtime::Runtime> {
+pub(crate) fn runtime() -> PyResult<&'static tokio::runtime::Runtime> {
     if let Some(rt) = RUNTIME.get() {
         return Ok(rt);
     }
@@ -63,32 +69,32 @@ const SETUP_DEADLINE_MARGIN: Duration = Duration::from_secs(5);
 /// portal and the first step of which waits on a human. The task outlives the
 /// object that spawned it, so an unanswered dialog would otherwise park a
 /// worker for the life of the process. `None` stays unbounded.
-struct SetupBudget {
+pub(crate) struct SetupBudget {
     until: Option<Instant>,
 }
 
 impl SetupBudget {
-    fn new(limit: Option<Duration>) -> Self {
+    pub(crate) fn new(limit: Option<Duration>) -> Self {
         Self {
             until: limit.map(|d| Instant::now() + d + SETUP_DEADLINE_MARGIN),
         }
     }
 
     /// Await `fut`, failing with a named error once the budget is spent.
-    async fn guard<T>(
+    pub(crate) async fn guard<T, E: From<String>>(
         &self,
         what: &str,
-        fut: impl Future<Output = Result<T, String>>,
-    ) -> Result<T, String> {
+        fut: impl Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
         let Some(until) = self.until else {
             return fut.await;
         };
         let left = until.saturating_duration_since(Instant::now());
         match tokio::time::timeout(left, fut).await {
             Ok(result) => result,
-            Err(_) => Err(format!(
+            Err(_) => Err(E::from(format!(
                 "{what}: the portal did not answer within the setup deadline"
-            )),
+            ))),
         }
     }
 }
@@ -271,7 +277,7 @@ fn build_segment_barriers(
 /// Only call this with an fd that was produced by `into_raw_fd` on this side
 /// and was never handed out: taking ownership back is only sound while nothing
 /// else can close it.
-fn close_orphan_fd(raw_fd: i32) {
+pub(crate) fn close_orphan_fd(raw_fd: i32) {
     // SAFETY: per the invariant above, this is the sole remaining owner.
     drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
 }
@@ -612,6 +618,12 @@ const MAX_TIMEOUT_SECS: f64 = 60.0;
 /// `setup(timeout=0)` is a caller asking to fail fast, and answering that with
 /// an unbounded wait is the worst possible reading.
 fn deadline_from(timeout: Option<f64>) -> PyResult<Option<Duration>> {
+    deadline_capped(timeout, MAX_TIMEOUT_SECS)
+}
+
+/// `deadline_from` with a caller-chosen ceiling, for waits that are a human
+/// answering a dialog rather than a portal answering a request.
+pub(crate) fn deadline_capped(timeout: Option<f64>, max_secs: f64) -> PyResult<Option<Duration>> {
     match timeout {
         None => Ok(None),
         Some(secs) if secs.is_nan() => Err(PyValueError::new_err(
@@ -622,8 +634,16 @@ fn deadline_from(timeout: Option<f64>) -> PyResult<Option<Duration>> {
              pass None to wait indefinitely"
         ))),
         Some(secs) if secs.is_infinite() => Ok(None),
-        Some(secs) => Ok(Some(Duration::from_secs_f64(secs.min(MAX_TIMEOUT_SECS)))),
+        Some(secs) => Ok(Some(Duration::from_secs_f64(secs.min(max_secs)))),
     }
+}
+
+/// How a wait for the portal task's answer ended.
+pub(crate) enum Waited<T> {
+    Answer(T),
+    TimedOut(Duration),
+    /// The task dropped its sender without answering.
+    Gone,
 }
 
 /// Wait for the portal task's answer without pinning the interpreter.
@@ -632,12 +652,12 @@ fn deadline_from(timeout: Option<f64>) -> PyResult<Option<Duration>> {
 /// comes back just long enough to run Python's signal handlers. Without that,
 /// a wait with no deadline is un-interruptible: the handler for Ctrl-C only
 /// runs when the thread executes bytecode, so the process has to be killed.
-fn wait_for_setup(
+pub(crate) fn wait_for<T: Send>(
     py: Python<'_>,
     handle: &tokio::runtime::Handle,
-    mut setup_rx: oneshot::Receiver<Result<SetupResult, String>>,
+    mut rx: oneshot::Receiver<T>,
     deadline: Option<Duration>,
-) -> PyResult<SetupResult> {
+) -> PyResult<Waited<T>> {
     const SLICE: Duration = Duration::from_millis(100);
     let started = Instant::now();
 
@@ -646,10 +666,7 @@ fn wait_for_setup(
             Some(limit) => {
                 let left = limit.saturating_sub(started.elapsed());
                 if left.is_zero() {
-                    return Err(PyRuntimeError::new_err(format!(
-                        "portal setup timed out after {}s (permission dialog unanswered?)",
-                        limit.as_secs_f64()
-                    )));
+                    return Ok(Waited::TimedOut(limit));
                 }
                 left.min(SLICE)
             }
@@ -657,16 +674,32 @@ fn wait_for_setup(
         };
 
         let outcome = py.allow_threads(|| {
-            handle.block_on(async { tokio::time::timeout(slice, &mut setup_rx).await })
+            handle.block_on(async { tokio::time::timeout(slice, &mut rx).await })
         });
 
         match outcome {
-            Ok(Ok(result)) => return result.map_err(PyRuntimeError::new_err),
-            Ok(Err(_)) => return Err(PyRuntimeError::new_err("portal setup channel closed")),
+            Ok(Ok(answer)) => return Ok(Waited::Answer(answer)),
+            Ok(Err(_)) => return Ok(Waited::Gone),
             // Slice expired with no answer: let Python raise a pending
             // KeyboardInterrupt, then keep waiting.
             Err(_) => py.check_signals()?,
         }
+    }
+}
+
+fn wait_for_setup(
+    py: Python<'_>,
+    handle: &tokio::runtime::Handle,
+    setup_rx: oneshot::Receiver<Result<SetupResult, String>>,
+    deadline: Option<Duration>,
+) -> PyResult<SetupResult> {
+    match wait_for(py, handle, setup_rx, deadline)? {
+        Waited::Answer(result) => result.map_err(PyRuntimeError::new_err),
+        Waited::TimedOut(limit) => Err(PyRuntimeError::new_err(format!(
+            "portal setup timed out after {}s (permission dialog unanswered?)",
+            limit.as_secs_f64()
+        ))),
+        Waited::Gone => Err(PyRuntimeError::new_err("portal setup channel closed")),
     }
 }
 
@@ -970,6 +1003,8 @@ impl Drop for InputCapturePortal {
 #[pymodule]
 fn pyinputcapture(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<InputCapturePortal>()?;
+    m.add_class::<remote_desktop::RemoteDesktopPortal>()?;
+    m.add_function(wrap_pyfunction!(remote_desktop::register_host_app, m)?)?;
     Ok(())
 }
 

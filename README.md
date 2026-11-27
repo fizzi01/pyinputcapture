@@ -2,7 +2,7 @@
 
 Python bindings for the [XDG InputCapture portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.InputCapture.html) on Wayland, built with [ashpd](https://github.com/bilelmoussaoui/ashpd) + [PyO3](https://pyo3.rs).
 
-Capture pointer input across monitor boundaries via `libei`. Provides both blocking and async APIs.
+Capture pointer input across monitor boundaries via `libei`. Provides both blocking and async APIs. Also wraps the RemoteDesktop portal for input emulation with a grant that survives restarts.
 
 ## Requirements
 
@@ -148,6 +148,42 @@ for when a client abuts only part of an edge — and returns the new
 `barrier_map`. Passing both raises `TypeError`; a diagonal segment raises
 `ValueError` naming its index. It reuses the live session on purpose:
 re-running `setup` is what hangs the GNOME portal.
+
+## RemoteDesktop (input emulation with a persistent grant)
+
+`RemoteDesktopPortal` opens a pointer-only RemoteDesktop session and returns
+the EIS fd for emulating input with libei. With `persist=True` the portal keeps
+the grant until the user revokes it, and the returned `restore_token` reopens
+the session with no dialog next time.
+
+```python
+from pyinputcapture import RemoteDesktopPortal, register_host_app
+
+register_host_app("org.example.App")  # before any other portal object
+rd = RemoteDesktopPortal()
+eis_fd, token = rd.setup(restore_token=saved_token, persist=True, timeout=300)
+save(token)  # single use: always keep the latest one
+# … emulate pointer input on eis_fd with libei …
+rd.close()
+```
+
+| Function / Method                                          | Description                                                       |
+|------------------------------------------------------------|-------------------------------------------------------------------|
+| `register_host_app(app_id)`                                | Register the app id grants are stored under (x-d-p >= 1.19.4)     |
+| `RemoteDesktopPortal.setup(restore_token, persist, timeout)` | Open the session. Returns `(eis_fd, restore_token)`              |
+| `RemoteDesktopPortal.close()`                              | End the session, or the wait for it, from any thread              |
+| `RemoteDesktopPortal.last_error`                           | Portal task's last error, or `None`                               |
+
+`setup` raises `PermissionError` when the portal refuses (a saved token is then
+worthless), `TimeoutError` when the dialog is not answered in time, and
+`RuntimeError` otherwise. `timeout` is capped at one hour.
+
+**Register before anything else.** The portal fixes a host process's app id on
+the first call over its D-Bus connection, and every portal object here shares
+that connection. Grants are keyed by app id, so it must name the app's
+`.desktop` file and stay the same across launches. Without a Registry
+(xdg-desktop-portal < 1.19.4) `register_host_app` raises `RuntimeError` and the
+portal falls back to the id of the process's systemd scope.
 
 ## Development
 

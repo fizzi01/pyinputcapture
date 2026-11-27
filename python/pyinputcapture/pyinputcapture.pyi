@@ -105,3 +105,52 @@ class InputCapturePortal:
     def close(self) -> None:
         """Close the session and shut down the background task."""
         ...
+
+
+class RemoteDesktopPortal:
+    """Wayland RemoteDesktop portal, pointer devices only, for libei emulation.
+
+    One object, one session: `setup` once, `close` (or drop) to end it.
+    """
+
+    def __init__(self) -> None: ...
+
+    @property
+    def last_error(self) -> str | None:
+        """The portal task's last error, or None. Cleared by `setup()`."""
+        ...
+
+    def setup(
+        self,
+        restore_token: str | None = None,
+        persist: bool = True,
+        timeout: float | None = 300.0,
+    ) -> tuple[int, str | None]:
+        """Open the session and connect to EIS. Returns (eis_fd, restore_token).
+
+        Blocks, with the GIL released, until the portal grants the session: at
+        once when `restore_token` is still valid, otherwise when the user
+        answers the dialog. The returned token is the one to present next time
+        (single use: always store the latest).
+
+        Raises PermissionError when the portal refuses (a saved token is then
+        worthless), TimeoutError past `timeout`, RuntimeError otherwise.
+        `close()` from another thread ends the wait. `timeout` is capped at
+        one hour; None waits indefinitely.
+        """
+        ...
+
+    def close(self) -> None:
+        """End the session, or the wait for it. Never blocks."""
+        ...
+
+def register_host_app(app_id: str) -> None:
+    """Tell the portal which app this non-sandboxed process is.
+
+    Grants are stored per app id. Call before any other portal object in the
+    process. Repeating the same id is a no-op; a different one raises
+    ValueError, as does an invalid id. Raises RuntimeError when the portal has
+    no Registry (xdg-desktop-portal < 1.19.4) and TimeoutError when it does not
+    answer; the process can carry on unregistered.
+    """
+    ...
