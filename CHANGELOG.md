@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/fizzi01/pyinputcapture/compare/v0.3.0...v0.4.0) (2026-11-27)
+
+
+### Features
+
+* add RemoteDesktopPortal with persistent grants ([#7](https://github.com/fizzi01/pyinputcapture/issues/7)) ([0ed1dd7](https://github.com/fizzi01/pyinputcapture/commit/0ed1dd738aab92cf3e7dd54b65c7be2565e906fc))
+
 ## [0.3.0](https://github.com/fizzi01/pyinputcapture/compare/v0.2.0...v0.3.0) (2026-08-01)
 
 
