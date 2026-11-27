@@ -8,7 +8,11 @@ import pytest
 
 
 try:
-    from pyinputcapture import InputCapturePortal
+    from pyinputcapture import (
+        InputCapturePortal,
+        RemoteDesktopPortal,
+        register_host_app,
+    )
 
     HAS_MODULE = True
 except ImportError:
@@ -324,3 +328,19 @@ class TestReleaseSignature:
         portal = InputCapturePortal()
         with pytest.raises(RuntimeError, match="not set up"):
             portal.release(cursor_x=1.0)
+
+
+class TestRemoteDesktopWithoutPortal:
+    def test_create_and_close(self):
+        rd = RemoteDesktopPortal()
+        assert rd.last_error is None
+        rd.close()
+        rd.close()
+
+    def test_zero_timeout_is_rejected(self):
+        with pytest.raises(ValueError):
+            RemoteDesktopPortal().setup(timeout=0)
+
+    def test_invalid_app_id_is_rejected_before_any_dbus_call(self):
+        with pytest.raises(ValueError, match="invalid app id"):
+            register_host_app("not an app id")
