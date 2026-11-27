@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/fizzi01/pyinputcapture/compare/v0.4.0...v0.5.0) (2026-11-27)
+
+
+### Features
+
+* add portal_versions to probe the portal interfaces ([#9](https://github.com/fizzi01/pyinputcapture/issues/9)) ([60f730a](https://github.com/fizzi01/pyinputcapture/commit/60f730a2a68d40ce2a84aa7c0786ff6cc87b9971))
+
 ## [0.4.0](https://github.com/fizzi01/pyinputcapture/compare/v0.3.0...v0.4.0) (2026-11-27)
 
 
