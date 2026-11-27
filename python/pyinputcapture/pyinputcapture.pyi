@@ -144,6 +144,16 @@ class RemoteDesktopPortal:
         """End the session, or the wait for it. Never blocks."""
         ...
 
+def portal_versions(timeout: float = 2.0) -> dict[str, int]:
+    """Versions of the portal interfaces this library drives, 0 when absent.
+
+    Keys are ``"remote_desktop"`` and ``"input_capture"``. RemoteDesktop needs
+    version 2 for libei (``ConnectToEIS``). Call ``register_host_app`` first:
+    this goes over the shared D-Bus connection. Raises TimeoutError when the
+    portal does not answer and RuntimeError when there is no portal to ask.
+    """
+    ...
+
 def register_host_app(app_id: str) -> None:
     """Tell the portal which app this non-sandboxed process is.
 

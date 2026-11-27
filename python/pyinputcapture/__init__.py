@@ -33,11 +33,18 @@ RemoteDesktop (input emulation via libei, grant kept across runs)::
     eis_fd, token = rd.setup(restore_token=saved_token)
     # … store `token`, emulate input on eis_fd with libei …
     rd.close()
+
+Which portals this desktop offers (pick a backend before opening one)::
+
+    from pyinputcapture import portal_versions
+
+    portal_versions()  # {"remote_desktop": 2, "input_capture": 1}; 0 = absent
 """
 
 from pyinputcapture.pyinputcapture import (
     InputCapturePortal,
     RemoteDesktopPortal,
+    portal_versions,
     register_host_app,
 )
 from pyinputcapture._async import AsyncInputCapturePortal
@@ -49,5 +56,6 @@ __all__ = [
     "AsyncInputCapturePortal",
     "RemoteDesktopPortal",
     "register_host_app",
+    "portal_versions",
     "__version__",
 ]

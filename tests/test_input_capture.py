@@ -11,6 +11,7 @@ try:
     from pyinputcapture import (
         InputCapturePortal,
         RemoteDesktopPortal,
+        portal_versions,
         register_host_app,
     )
 
@@ -344,3 +345,19 @@ class TestRemoteDesktopWithoutPortal:
     def test_invalid_app_id_is_rejected_before_any_dbus_call(self):
         with pytest.raises(ValueError, match="invalid app id"):
             register_host_app("not an app id")
+
+
+class TestPortalVersions:
+    @pytest.mark.parametrize("timeout", [0, -1.0, float("nan")])
+    def test_a_bad_timeout_is_rejected_before_any_dbus_call(self, timeout):
+        with pytest.raises(ValueError, match="timeout"):
+            portal_versions(timeout=timeout)
+
+    def test_it_answers_or_says_why_not(self):
+        # No portal here (CI, macOS): an error, never a hang or a crash.
+        try:
+            versions = portal_versions(timeout=2.0)
+        except (RuntimeError, TimeoutError):
+            return
+        assert set(versions) == {"remote_desktop", "input_capture"}
+        assert all(isinstance(v, int) and v >= 0 for v in versions.values())

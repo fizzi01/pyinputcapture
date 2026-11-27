@@ -185,6 +185,25 @@ that connection. Grants are keyed by app id, so it must name the app's
 (xdg-desktop-portal < 1.19.4) `register_host_app` raises `RuntimeError` and the
 portal falls back to the id of the process's systemd scope.
 
+## Portal capabilities
+
+`portal_versions(timeout=2.0)` asks the portal which of the interfaces this
+library drives it offers, so a caller can pick its backend from what the
+desktop can do instead of from `XDG_CURRENT_DESKTOP`:
+
+```python
+from pyinputcapture import portal_versions, register_host_app
+
+register_host_app("org.example.App")  # still first: same D-Bus connection
+versions = portal_versions()           # {"remote_desktop": 2, "input_capture": 1}
+can_emulate = versions["remote_desktop"] >= 2   # ConnectToEIS (libei)
+can_capture = versions["input_capture"] >= 1
+```
+
+An interface the portal does not offer reads as `0`. It raises `TimeoutError`
+when the portal does not answer within `timeout` and `RuntimeError` when there
+is no portal service at all (no session bus, no xdg-desktop-portal).
+
 ## Development
 
 ```bash
