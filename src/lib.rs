@@ -29,6 +29,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use tokio::sync::{mpsc, oneshot};
 
+mod capabilities;
 mod remote_desktop;
 
 /// A poisoned lock only means some other thread panicked while holding it; the
@@ -1005,6 +1006,7 @@ fn pyinputcapture(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<InputCapturePortal>()?;
     m.add_class::<remote_desktop::RemoteDesktopPortal>()?;
     m.add_function(wrap_pyfunction!(remote_desktop::register_host_app, m)?)?;
+    m.add_function(wrap_pyfunction!(capabilities::portal_versions, m)?)?;
     Ok(())
 }
 
